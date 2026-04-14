@@ -1,0 +1,14 @@
+name = "taproot"
+main = "src/index.ts"
+compatibility_date = "2025-04-14"
+
+[[kv_namespaces]]
+binding = "TAPROOT_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID"
+
+# Secrets are set via the CLI, not this file:
+#   wrangler secret put TAPROOT_AUTH_TOKEN
+#
+# For local dev, create .dev.vars (gitignored) with:
+#   TAPROOT_AUTH_TOKEN=any-string-you-choose
