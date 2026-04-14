@@ -1,0 +1,23 @@
+name = "taproot"
+main = "src/index.ts"
+compatibility_date = "2025-04-14"
+
+[[kv_namespaces]]
+binding = "TAPROOT_KV"
+id = "c96d873c96c1416b8b22cb86e3bf4940"
+preview_id = "0df2a7ace7884ca68416230cd0e5abbb"
+
+# Required by @cloudflare/workers-oauth-provider.
+# Create with: wrangler kv namespace create OAUTH_KV
+#              wrangler kv namespace create OAUTH_KV --preview
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "REPLACE_WITH_YOUR_OAUTH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_OAUTH_KV_PREVIEW_ID"
+
+# Secrets are set via the CLI, not this file:
+#   wrangler secret put TAPROOT_AUTH_TOKEN
+#     — acts as the login password on the OAuth consent screen.
+#
+# For local dev, create .dev.vars (gitignored) with:
+#   TAPROOT_AUTH_TOKEN=any-string-you-choose
