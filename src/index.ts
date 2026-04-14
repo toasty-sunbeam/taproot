@@ -1,12 +1,25 @@
 // Taproot MCP Server — Cloudflare Worker
-// Phase 1 scaffold: all tools are stubbed, KV not yet wired.
+// Phase 1 scaffold: tools are stubbed, KV not yet wired.
+// Auth is handled by @cloudflare/workers-oauth-provider (RFC 7591 DCR).
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+import {
+  OAuthProvider,
+  type OAuthHelpers,
+  type AuthRequest,
+  type ClientInfo,
+} from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+// ─── Env ──────────────────────────────────────────────────────────────────────
 
 export interface Env {
   TAPROOT_KV: KVNamespace;
+  OAUTH_KV: KVNamespace;
   TAPROOT_AUTH_TOKEN: string;
+  OAUTH_PROVIDER: OAuthHelpers;
 }
+
+// ─── MCP JSON-RPC types ───────────────────────────────────────────────────────
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -223,7 +236,7 @@ async function handleStatus(_params: unknown, _env: Env): Promise<string> {
   }, null, 2);
 }
 
-// ─── MCP Protocol ─────────────────────────────────────────────────────────────
+// ─── MCP Protocol Dispatch ────────────────────────────────────────────────────
 
 function jsonOk(id: string | number | null, result: unknown): Response {
   const body: JsonRpcResponse = { jsonrpc: "2.0", id, result };
@@ -241,6 +254,8 @@ function jsonErr(id: string | number | null, code: number, message: string): Res
 }
 
 async function handleMcp(request: Request, env: Env): Promise<Response> {
+  // No auth check here — the OAuth provider validates the access token
+  // before this handler is ever invoked.
   let body: JsonRpcRequest;
   try {
     body = (await request.json()) as JsonRpcRequest;
@@ -298,10 +313,28 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
   }
 }
 
-// ─── Worker Entry Point ───────────────────────────────────────────────────────
+// ─── API Handler (authenticated requests) ───────────────────────────────────
+// The OAuth provider validates the access token before calling this.
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+class TaprootApiHandler extends WorkerEntrypoint<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/mcp" && request.method === "POST") {
+      return handleMcp(request, this.env);
+    }
+
+    return new Response(JSON.stringify({ error: "Not found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
+
+// ─── Default Handler (/health, /authorize, unknown routes) ──────────────────
+
+const defaultHandler: ExportedHandler<Env> = {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     // Unauthenticated health check
@@ -311,17 +344,47 @@ export default {
       });
     }
 
-    // All other routes require bearer token
-    const auth = request.headers.get("Authorization");
-    if (!auth || auth !== `Bearer ${env.TAPROOT_AUTH_TOKEN}`) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    // OAuth authorization flow — password-gated consent screen.
+    if (url.pathname === "/authorize") {
+      if (request.method === "GET") {
+        const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+        const clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+        return renderLoginForm(oauthReqInfo, clientInfo);
+      }
 
-    if (url.pathname === "/mcp" && request.method === "POST") {
-      return handleMcp(request, env);
+      if (request.method === "POST") {
+        const formData = await request.formData();
+        const password = formData.get("password");
+        const oauthReqEncoded = formData.get("oauth_req");
+
+        if (typeof password !== "string" || typeof oauthReqEncoded !== "string") {
+          return new Response("Bad request", { status: 400 });
+        }
+
+        let oauthReqInfo: AuthRequest;
+        try {
+          oauthReqInfo = JSON.parse(atob(oauthReqEncoded)) as AuthRequest;
+        } catch {
+          return new Response("Invalid oauth_req payload", { status: 400 });
+        }
+
+        if (password !== env.TAPROOT_AUTH_TOKEN) {
+          const clientInfo = await env.OAUTH_PROVIDER.lookupClient(oauthReqInfo.clientId);
+          return renderLoginForm(oauthReqInfo, clientInfo, "Incorrect auth token.");
+        }
+
+        const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: oauthReqInfo,
+          userId: "james",
+          metadata: { label: "Taproot single-user grant" },
+          scope: oauthReqInfo.scope,
+          props: { userId: "james" },
+        });
+
+        return Response.redirect(redirectTo, 302);
+      }
+
+      return new Response("Method not allowed", { status: 405 });
     }
 
     return new Response(JSON.stringify({ error: "Not found" }), {
@@ -330,3 +393,94 @@ export default {
     });
   },
 };
+
+// ─── Consent Screen UI ──────────────────────────────────────────────────────
+
+function renderLoginForm(
+  oauthReqInfo: AuthRequest,
+  clientInfo: ClientInfo | null,
+  errorMsg?: string,
+): Response {
+  const encoded = btoa(JSON.stringify(oauthReqInfo));
+  const clientName = clientInfo?.clientName ?? "An unknown client";
+  const clientUri = clientInfo?.clientUri;
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Taproot — Authorize</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      max-width: 480px;
+      margin: 80px auto;
+      padding: 20px;
+      background: #fafafa;
+      color: #222;
+    }
+    h1 { font-weight: 500; margin-bottom: 4px; }
+    p { color: #555; line-height: 1.5; }
+    .client { font-weight: 600; color: #222; }
+    form { display: flex; flex-direction: column; gap: 12px; margin-top: 20px; }
+    input[type="password"] {
+      padding: 10px 12px;
+      font-size: 16px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-family: inherit;
+    }
+    button {
+      padding: 10px 12px;
+      font-size: 16px;
+      border: none;
+      background: #1a1a1a;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover { background: #444; }
+    .error { color: #b00020; margin-top: 4px; font-size: 14px; }
+    .subtitle { color: #888; font-size: 13px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Taproot</h1>
+  <p><span class="client">${escapeHtml(clientName)}</span> is requesting access to your memory store.</p>
+  ${clientUri ? `<p class="subtitle">${escapeHtml(clientUri)}</p>` : ""}
+  <form method="POST" action="/authorize">
+    <input type="password" name="password" placeholder="Auth token" required autofocus />
+    <input type="hidden" name="oauth_req" value="${escapeHtml(encoded)}" />
+    <button type="submit">Authorize</button>
+    ${errorMsg ? `<div class="error">${escapeHtml(errorMsg)}</div>` : ""}
+  </form>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: errorMsg ? 401 : 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ─── OAuth Provider (default export) ─────────────────────────────────────────
+
+export default new OAuthProvider<Env>({
+  apiRoute: "/mcp",
+  apiHandler: TaprootApiHandler,
+  defaultHandler,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+});
