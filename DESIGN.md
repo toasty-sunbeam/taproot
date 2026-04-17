@@ -474,8 +474,8 @@ These trade-offs are acceptable for a single-user v0.x deployment. Future harden
 - ✅ Set up Cloudflare Worker with KV storage.
 - ✅ Define the six MCP tools as stubs and verify the JSON-RPC dispatch works end-to-end.
 - ✅ Stand up OAuth 2.1 + DCR auth layer. **(Scope expanded from the v0.1 plan; see §11.)**
-- Connect to Claude.ai via the Custom Connector UI and verify the full loop: add connector → password → Claude calls `taproot_status` and gets a stub response.
-- Implement `taproot_reflect`, `taproot_remember`, and `taproot_status` against real `TAPROOT_KV` reads and writes.
+- ✅ Connect to Claude.ai via the Custom Connector UI and verify the full loop: add connector → password → Claude calls `taproot_status` and gets a stub response.
+- ✅ Implement `taproot_reflect`, `taproot_remember`, and `taproot_status` against real `TAPROOT_KV` reads and writes.
 - Implement `taproot_recall` (keyword/tag matching initially) and `taproot_forget`.
 - Manually seed initial memories from the Junk Drawer v2 seed document.
 - Test the basic read/write loop: Claude calls reflect at start, remember during conversation.
