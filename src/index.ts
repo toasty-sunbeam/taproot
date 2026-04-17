@@ -1,5 +1,4 @@
 // Taproot MCP Server — Cloudflare Worker
-// Phase 1 scaffold: tools are stubbed, KV not yet wired.
 // Auth is handled by @cloudflare/workers-oauth-provider (RFC 7591 DCR).
 
 import {
@@ -9,6 +8,7 @@ import {
   type ClientInfo,
 } from "@cloudflare/workers-oauth-provider";
 import { WorkerEntrypoint } from "cloudflare:workers";
+import type { Memory, MemoryCategory, MemorySalience } from "./types.js";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
@@ -162,77 +162,241 @@ const TOOLS = [
   },
 ];
 
-// ─── Stub Tool Handlers ───────────────────────────────────────────────────────
-// Each returns a JSON string. Replace stubs with real KV logic in Phase 1.
+// ─── KV Storage Helpers ───────────────────────────────────────────────────────
+// Key format: mem:{uuid}
+// KV metadata mirrors the fields needed for filtering, so list() results can
+// be filtered without fetching full values.
 
-async function handleReflect(_params: unknown, _env: Env): Promise<string> {
+interface MemoryMeta {
+  category: MemoryCategory;
+  salience: MemorySalience;
+  created_at: string;
+  updated_at: string;
+  tags: string[];
+}
+
+async function listMemoryKeys(kv: KVNamespace): Promise<Array<{ name: string; metadata?: MemoryMeta }>> {
+  const keys: Array<{ name: string; metadata?: MemoryMeta }> = [];
+  let cursor: string | undefined;
+  do {
+    const result = await kv.list<MemoryMeta>({ prefix: "mem:", ...(cursor ? { cursor } : {}) });
+    for (const k of result.keys) {
+      keys.push({ name: k.name, metadata: k.metadata ?? undefined });
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+  return keys;
+}
+
+function idFromKey(key: string): string {
+  return key.slice("mem:".length);
+}
+
+async function getMemory(kv: KVNamespace, id: string): Promise<Memory | null> {
+  const raw = await kv.get(`mem:${id}`);
+  if (!raw) return null;
+  return JSON.parse(raw) as Memory;
+}
+
+async function putMemory(kv: KVNamespace, memory: Memory): Promise<void> {
+  const meta: MemoryMeta = {
+    category: memory.category,
+    salience: memory.salience,
+    created_at: memory.created_at,
+    updated_at: memory.updated_at,
+    tags: memory.tags,
+  };
+  await kv.put(`mem:${memory.id}`, JSON.stringify(memory), { metadata: meta });
+}
+
+// ─── Tool Handlers ────────────────────────────────────────────────────────────
+
+async function handleReflect(_params: unknown, env: Env): Promise<string> {
+  const coreCategories: MemoryCategory[] = ["identity", "relationship", "active_thread", "error"];
+  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+  const coreKeys = allKeys.filter(k => k.metadata && coreCategories.includes(k.metadata.category));
+
+  const memories = (
+    await Promise.all(coreKeys.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
+  ).filter((m): m is Memory => m !== null);
+
   return JSON.stringify({
-    status: "stub",
-    note: "KV storage not yet wired. This is the Phase 1 scaffold.",
-    identity_observations: [],
-    relationship_texture: [],
-    active_threads: [],
-    error_log: [],
+    status: "ok",
+    identity_observations: memories.filter(m => m.category === "identity"),
+    relationship_texture: memories.filter(m => m.category === "relationship"),
+    active_threads: memories.filter(m => m.category === "active_thread"),
+    error_log: memories.filter(m => m.category === "error"),
+    total: memories.length,
   }, null, 2);
 }
 
-async function handleRemember(params: unknown, _env: Env): Promise<string> {
+async function handleRemember(params: unknown, env: Env): Promise<string> {
   const p = params as {
-    category: string;
+    category: MemoryCategory;
     content: string;
-    salience?: string;
+    salience?: MemorySalience;
     tags?: string[];
     linked_memories?: string[];
     update_id?: string;
   };
-  return JSON.stringify({
-    status: "stub",
-    note: "Memory received but NOT persisted — KV not yet wired.",
-    would_write: {
+
+  const now = new Date().toISOString();
+  let memory: Memory;
+
+  if (p.update_id) {
+    const existing = await getMemory(env.TAPROOT_KV, p.update_id);
+    if (!existing) {
+      return JSON.stringify({ status: "error", message: `Memory ${p.update_id} not found` }, null, 2);
+    }
+    memory = {
+      ...existing,
+      category: p.category,
+      content: p.content,
+      salience: p.salience ?? existing.salience,
+      tags: p.tags ?? existing.tags,
+      linked_memories: p.linked_memories ?? existing.linked_memories,
+      updated_at: now,
+    };
+  } else {
+    memory = {
       id: crypto.randomUUID(),
       category: p.category,
       content: p.content,
       salience: p.salience ?? "medium",
+      created_at: now,
+      updated_at: now,
+      source: { type: "direct_observation" },
+      compression_level: 0,
+      linked_memories: p.linked_memories ?? [],
       tags: p.tags ?? [],
-    },
+    };
+  }
+
+  await putMemory(env.TAPROOT_KV, memory);
+
+  return JSON.stringify({
+    status: "ok",
+    action: p.update_id ? "updated" : "created",
+    memory_id: memory.id,
+    category: memory.category,
   }, null, 2);
 }
 
-async function handleRecall(params: unknown, _env: Env): Promise<string> {
+async function handleRecall(params: unknown, env: Env): Promise<string> {
+  const p = params as {
+    query?: string;
+    category?: MemoryCategory;
+    tags?: string[];
+    since?: string;
+    limit?: number;
+  };
+
+  const limit = p.limit ?? 10;
+  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+
+  // Filter using metadata to avoid fetching records we'll discard
+  let candidates = allKeys;
+  if (p.category) {
+    candidates = candidates.filter(k => k.metadata?.category === p.category);
+  }
+  if (p.tags && p.tags.length > 0) {
+    candidates = candidates.filter(k =>
+      p.tags!.every(tag => k.metadata?.tags.includes(tag))
+    );
+  }
+  if (p.since) {
+    const sinceDate = new Date(p.since).toISOString();
+    candidates = candidates.filter(k =>
+      k.metadata?.updated_at != null && k.metadata.updated_at >= sinceDate
+    );
+  }
+
+  const memories = (
+    await Promise.all(candidates.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
+  ).filter((m): m is Memory => m !== null);
+
+  let results = memories;
+  if (p.query) {
+    const q = p.query.toLowerCase();
+    results = results.filter(m => m.content.toLowerCase().includes(q));
+  }
+
+  results.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
   return JSON.stringify({
-    status: "stub",
-    note: "KV not yet wired.",
-    query_received: params,
-    results: [],
+    status: "ok",
+    count: Math.min(results.length, limit),
+    results: results.slice(0, limit),
   }, null, 2);
 }
 
-async function handleForget(params: unknown, _env: Env): Promise<string> {
-  const p = params as { memory_id: string; action: string; reason?: string };
+async function handleForget(params: unknown, env: Env): Promise<string> {
+  const p = params as { memory_id: string; action: "compress" | "archive" | "delete"; reason?: string };
+
+  const memory = await getMemory(env.TAPROOT_KV, p.memory_id);
+  if (!memory) {
+    return JSON.stringify({ status: "error", message: `Memory ${p.memory_id} not found` }, null, 2);
+  }
+
+  if (p.action === "delete") {
+    await env.TAPROOT_KV.delete(`mem:${p.memory_id}`);
+    return JSON.stringify({ status: "ok", action: "deleted", memory_id: p.memory_id }, null, 2);
+  }
+
+  // compress / archive: tag the memory for the Phase 3 compression engine
+  const pendingTag = p.action === "compress" ? "_compress_pending" : "_archive_pending";
+  if (!memory.tags.includes(pendingTag)) {
+    memory.tags.push(pendingTag);
+  }
+  if (p.action === "compress") {
+    memory.salience = "low";
+  }
+  memory.updated_at = new Date().toISOString();
+  await putMemory(env.TAPROOT_KV, memory);
+
   return JSON.stringify({
-    status: "stub",
-    note: "Action received but NOT applied — KV not yet wired.",
-    memory_id: p.memory_id,
+    status: "ok",
     action: p.action,
+    memory_id: p.memory_id,
+    note: `Marked for ${p.action}. The compression engine will process this in Phase 3.`,
   }, null, 2);
 }
 
 async function handleTranscript(_params: unknown, _env: Env): Promise<string> {
   return JSON.stringify({
-    status: "stub",
-    note: "Transcript archive not yet implemented (Phase 2).",
+    status: "not_implemented",
+    note: "Transcript archive is Phase 2.",
     results: [],
   }, null, 2);
 }
 
-async function handleStatus(_params: unknown, _env: Env): Promise<string> {
+async function handleStatus(_params: unknown, env: Env): Promise<string> {
+  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+
+  const counts: Record<MemoryCategory, number> = {
+    identity: 0,
+    relationship: 0,
+    active_thread: 0,
+    episodic: 0,
+    error: 0,
+  };
+  let compressionQueue = 0;
+
+  for (const k of allKeys) {
+    const cat = k.metadata?.category;
+    if (cat && cat in counts) counts[cat]++;
+    if (k.metadata?.tags.some(t => t === "_compress_pending" || t === "_archive_pending")) {
+      compressionQueue++;
+    }
+  }
+
   return JSON.stringify({
     status: "operational",
-    phase: "scaffold",
-    storage: "not_yet_wired",
-    memory_counts: { identity: 0, relationship: 0, active_thread: 0, episodic: 0, error: 0 },
-    total_memories: 0,
-    note: "Taproot is running. KV storage not yet connected.",
+    phase: "1",
+    storage: "connected",
+    memory_counts: counts,
+    total_memories: allKeys.length,
+    compression_queue: compressionQueue,
   }, null, 2);
 }
 
