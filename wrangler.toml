@@ -12,8 +12,8 @@ preview_id = "0df2a7ace7884ca68416230cd0e5abbb"
 #              wrangler kv namespace create OAUTH_KV --preview
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "REPLACE_WITH_YOUR_OAUTH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_YOUR_OAUTH_KV_PREVIEW_ID"
+id = "3226757405da43afa1594737360998df"
+preview_id = "b57466b274724adfbd43c6c8216823ac"
 
 # Secrets are set via the CLI, not this file:
 #   wrangler secret put TAPROOT_AUTH_TOKEN
