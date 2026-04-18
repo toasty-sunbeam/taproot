@@ -8,7 +8,7 @@ import {
   type ClientInfo,
 } from "@cloudflare/workers-oauth-provider";
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { Memory, MemoryCategory, MemorySalience, Transcript, TranscriptRow } from "./types.js";
+import type { Memory, MemoryCategory, MemorySalience } from "./types.js";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
@@ -82,11 +82,20 @@ const TOOLS = [
         },
         conversation_id: {
           type: "string",
-          description: "Source conversation ID — links this memory to an archived transcript",
+          description: "Source conversation ID — links this memory to a conversation",
         },
         transcript_ref: {
           type: "string",
           description: "Transcript archive ID if different from conversation_id",
+        },
+        conversation_url: {
+          type: "string",
+          description: "URL of the Claude.ai conversation where this memory originated. Format: https://claude.ai/chat/{id}. Used for provenance so future Claude instances can navigate back to the source.",
+        },
+        search_keywords: {
+          type: "array",
+          items: { type: "string" },
+          description: "Key terms and distinctive phrases from the conversation to help future Claude instances find relevant context via conversation_search. Use content words that appeared in the actual conversation (e.g. 'Pettit', 'non-domination', 'tank mindset'). Different from tags, which search within Taproot.",
         },
         update_id: {
           type: "string",
@@ -124,15 +133,15 @@ const TOOLS = [
   },
   {
     name: "taproot_forget",
-    description: "Mark a memory for compression, archival, or deletion.",
+    description: "Archive or delete a memory.",
     inputSchema: {
       type: "object",
       properties: {
         memory_id: { type: "string", description: "Memory ID to act on" },
         action: {
           type: "string",
-          enum: ["compress", "archive", "delete"],
-          description: "Action to take",
+          enum: ["archive", "delete"],
+          description: "archive: soft delete — hidden from recall but retained in storage. delete: hard delete — removed from KV entirely.",
         },
         reason: {
           type: "string",
@@ -140,27 +149,6 @@ const TOOLS = [
         },
       },
       required: ["memory_id", "action"],
-    },
-  },
-  {
-    name: "taproot_transcript",
-    description: "Retrieve raw archived conversation transcripts. Transcripts are ingested via POST /transcripts (authenticated). Search by conversation_id, full-text query, or date range.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        conversation_id: { type: "string", description: "Retrieve a specific conversation" },
-        search_query: { type: "string", description: "Full-text search across transcripts" },
-        date_range: {
-          type: "object",
-          properties: {
-            from: { type: "string" },
-            to: { type: "string" },
-          },
-          description: "Filter by date range (ISO timestamps)",
-        },
-        limit: { type: "number", description: "Maximum results (default: 5)" },
-      },
-      required: [],
     },
   },
   {
@@ -248,6 +236,8 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     linked_memories?: string[];
     conversation_id?: string;
     transcript_ref?: string;
+    conversation_url?: string;
+    search_keywords?: string[];
     update_id?: string;
   };
 
@@ -271,6 +261,8 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
         ...(p.conversation_id !== undefined ? { conversation_id: p.conversation_id } : {}),
         ...(p.transcript_ref !== undefined ? { transcript_ref: p.transcript_ref } : {}),
       },
+      conversation_url: p.conversation_url ?? existing.conversation_url,
+      search_keywords: p.search_keywords ?? existing.search_keywords,
       updated_at: now,
     };
   } else {
@@ -289,6 +281,8 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
       compression_level: 0,
       linked_memories: p.linked_memories ?? [],
       tags: p.tags ?? [],
+      ...(p.conversation_url !== undefined ? { conversation_url: p.conversation_url } : {}),
+      search_keywords: p.search_keywords ?? [],
     };
   }
 
@@ -316,6 +310,8 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
 
   // Filter using metadata to avoid fetching records we'll discard
   let candidates = allKeys;
+  // Exclude archived memories from normal recall
+  candidates = candidates.filter(k => !k.metadata?.tags.includes("_archive_pending"));
   if (p.category) {
     candidates = candidates.filter(k => k.metadata?.category === p.category);
   }
@@ -338,7 +334,11 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
   let results = memories;
   if (p.query) {
     const q = p.query.toLowerCase();
-    results = results.filter(m => m.content.toLowerCase().includes(q));
+    results = results.filter(m =>
+      m.content.toLowerCase().includes(q) ||
+      m.tags.some(t => t.toLowerCase().includes(q)) ||
+      (m.search_keywords ?? []).some(kw => kw.toLowerCase().includes(q))
+    );
   }
 
   results.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -351,7 +351,11 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
 }
 
 async function handleForget(params: unknown, env: Env): Promise<string> {
-  const p = params as { memory_id: string; action: "compress" | "archive" | "delete"; reason?: string };
+  const p = params as { memory_id: string; action: "archive" | "delete"; reason?: string };
+
+  if (p.action !== "archive" && p.action !== "delete") {
+    return JSON.stringify({ status: "error", message: `Unknown action: ${String(p.action)}. Use "archive" or "delete".` }, null, 2);
+  }
 
   const memory = await getMemory(env.TAPROOT_KV, p.memory_id);
   if (!memory) {
@@ -363,130 +367,19 @@ async function handleForget(params: unknown, env: Env): Promise<string> {
     return JSON.stringify({ status: "ok", action: "deleted", memory_id: p.memory_id }, null, 2);
   }
 
-  // compress / archive: tag the memory for the Phase 3 compression engine
-  const pendingTag = p.action === "compress" ? "_compress_pending" : "_archive_pending";
-  if (!memory.tags.includes(pendingTag)) {
-    memory.tags.push(pendingTag);
-  }
-  if (p.action === "compress") {
-    memory.salience = "low";
+  // archive: soft delete — tag the memory so it's excluded from normal recall
+  if (!memory.tags.includes("_archive_pending")) {
+    memory.tags.push("_archive_pending");
   }
   memory.updated_at = new Date().toISOString();
   await putMemory(env.TAPROOT_KV, memory);
 
   return JSON.stringify({
     status: "ok",
-    action: p.action,
+    action: "archived",
     memory_id: p.memory_id,
-    note: `Marked for ${p.action}. The compression engine will process this in Phase 3.`,
+    note: "Memory archived. Hidden from taproot_recall but retained in storage.",
   }, null, 2);
-}
-
-async function handleTranscript(params: unknown, env: Env): Promise<string> {
-  const p = params as {
-    conversation_id?: string;
-    search_query?: string;
-    date_range?: { from?: string; to?: string };
-    limit?: number;
-  };
-  const limit = Math.min(p.limit ?? 5, 20);
-
-  if (p.conversation_id) {
-    const row = await env.TAPROOT_D1
-      .prepare("SELECT id, title, content, conversation_date, created_at FROM transcripts WHERE id = ?")
-      .bind(p.conversation_id)
-      .first<Transcript>();
-    if (!row) {
-      return JSON.stringify({ status: "not_found", conversation_id: p.conversation_id }, null, 2);
-    }
-    return JSON.stringify({ status: "ok", count: 1, results: [row] }, null, 2);
-  }
-
-  if (p.search_query) {
-    // FTS5 snippet: highlight matches in content column (index 2), 40 tokens of context
-    let sql = `
-      SELECT t.id, t.title, t.conversation_date, t.created_at,
-             snippet(transcripts_fts, 2, '[', ']', '…', 40) AS excerpt
-      FROM transcripts_fts f
-      JOIN transcripts t ON t.rowid = f.rowid
-      WHERE transcripts_fts MATCH ?`;
-    const bindings: unknown[] = [p.search_query];
-
-    if (p.date_range?.from) {
-      sql += " AND t.conversation_date >= ?";
-      bindings.push(p.date_range.from);
-    }
-    if (p.date_range?.to) {
-      sql += " AND t.conversation_date <= ?";
-      bindings.push(p.date_range.to);
-    }
-    sql += " ORDER BY rank LIMIT ?";
-    bindings.push(limit);
-
-    const { results } = await env.TAPROOT_D1.prepare(sql).bind(...bindings).all<TranscriptRow>();
-    return JSON.stringify({ status: "ok", count: results.length, results }, null, 2);
-  }
-
-  // List by date range or most-recent
-  let sql = `
-    SELECT id, title, conversation_date, created_at,
-           substr(content, 1, 300) AS excerpt
-    FROM transcripts WHERE 1=1`;
-  const bindings: unknown[] = [];
-
-  if (p.date_range?.from) {
-    sql += " AND conversation_date >= ?";
-    bindings.push(p.date_range.from);
-  }
-  if (p.date_range?.to) {
-    sql += " AND conversation_date <= ?";
-    bindings.push(p.date_range.to);
-  }
-  sql += " ORDER BY coalesce(conversation_date, created_at) DESC LIMIT ?";
-  bindings.push(limit);
-
-  const { results } = await env.TAPROOT_D1.prepare(sql).bind(...bindings).all<TranscriptRow>();
-  return JSON.stringify({ status: "ok", count: results.length, results }, null, 2);
-}
-
-async function handleIngestTranscript(request: Request, env: Env): Promise<Response> {
-  let body: { id?: string; title?: string; content: string; conversation_date?: string };
-  try {
-    body = (await request.json()) as typeof body;
-  } catch {
-    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  if (!body.content || typeof body.content !== "string") {
-    return new Response(JSON.stringify({ error: "content is required" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const id = body.id ?? crypto.randomUUID();
-  const now = new Date().toISOString();
-
-  try {
-    await env.TAPROOT_D1
-      .prepare("INSERT INTO transcripts (id, title, content, conversation_date, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind(id, body.title ?? null, body.content, body.conversation_date ?? null, now)
-      .run();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "D1 error";
-    return new Response(JSON.stringify({ error: msg }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  return new Response(JSON.stringify({ status: "ok", id, created_at: now }), {
-    status: 201,
-    headers: { "Content-Type": "application/json" },
-  });
 }
 
 async function handleStatus(_params: unknown, env: Env): Promise<string> {
@@ -583,7 +476,6 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
           case "taproot_remember":  result = await handleRemember(args, env); break;
           case "taproot_recall":    result = await handleRecall(args, env); break;
           case "taproot_forget":    result = await handleForget(args, env); break;
-          case "taproot_transcript":result = await handleTranscript(args, env); break;
           case "taproot_status":    result = await handleStatus(args, env); break;
           default:
             return jsonErr(id, -32601, `Unknown tool: ${p.name}`);
@@ -610,12 +502,6 @@ class TaprootApiHandler extends WorkerEntrypoint<Env> {
 
     if (url.pathname === "/mcp" && request.method === "POST") {
       return handleMcp(request, this.env);
-    }
-
-    // Transcript ingestion: POST /transcripts with JSON body
-    // { id?, title?, content, conversation_date? }
-    if (url.pathname === "/transcripts" && request.method === "POST") {
-      return handleIngestTranscript(request, this.env);
     }
 
     return new Response(JSON.stringify({ error: "Not found" }), {
