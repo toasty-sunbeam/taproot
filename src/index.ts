@@ -266,6 +266,11 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
       salience: p.salience ?? existing.salience,
       tags: p.tags ?? existing.tags,
       linked_memories: p.linked_memories ?? existing.linked_memories,
+      source: {
+        ...existing.source,
+        ...(p.conversation_id !== undefined ? { conversation_id: p.conversation_id } : {}),
+        ...(p.transcript_ref !== undefined ? { transcript_ref: p.transcript_ref } : {}),
+      },
       updated_at: now,
     };
   } else {
