@@ -8,7 +8,7 @@ import {
   type ClientInfo,
 } from "@cloudflare/workers-oauth-provider";
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { Memory, MemoryCategory, MemorySalience } from "./types.js";
+import type { Memory, MemoryCategory, MemorySalience, Transcript, TranscriptRow } from "./types.js";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,7 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   TAPROOT_AUTH_TOKEN: string;
   OAUTH_PROVIDER: OAuthHelpers;
+  TAPROOT_D1: D1Database;
 }
 
 // ─── MCP JSON-RPC types ───────────────────────────────────────────────────────
@@ -79,6 +80,14 @@ const TOOLS = [
           items: { type: "string" },
           description: "IDs of related memories to link",
         },
+        conversation_id: {
+          type: "string",
+          description: "Source conversation ID — links this memory to an archived transcript",
+        },
+        transcript_ref: {
+          type: "string",
+          description: "Transcript archive ID if different from conversation_id",
+        },
         update_id: {
           type: "string",
           description: "If provided, updates this existing memory instead of creating a new one",
@@ -135,7 +144,7 @@ const TOOLS = [
   },
   {
     name: "taproot_transcript",
-    description: "Retrieve raw archived conversation transcripts.",
+    description: "Retrieve raw archived conversation transcripts. Transcripts are ingested via POST /transcripts (authenticated). Search by conversation_id, full-text query, or date range.",
     inputSchema: {
       type: "object",
       properties: {
@@ -237,6 +246,8 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     salience?: MemorySalience;
     tags?: string[];
     linked_memories?: string[];
+    conversation_id?: string;
+    transcript_ref?: string;
     update_id?: string;
   };
 
@@ -255,6 +266,11 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
       salience: p.salience ?? existing.salience,
       tags: p.tags ?? existing.tags,
       linked_memories: p.linked_memories ?? existing.linked_memories,
+      source: {
+        ...existing.source,
+        ...(p.conversation_id !== undefined ? { conversation_id: p.conversation_id } : {}),
+        ...(p.transcript_ref !== undefined ? { transcript_ref: p.transcript_ref } : {}),
+      },
       updated_at: now,
     };
   } else {
@@ -265,7 +281,11 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
       salience: p.salience ?? "medium",
       created_at: now,
       updated_at: now,
-      source: { type: "direct_observation" },
+      source: {
+        type: "direct_observation",
+        ...(p.conversation_id ? { conversation_id: p.conversation_id } : {}),
+        ...(p.transcript_ref ? { transcript_ref: p.transcript_ref } : {}),
+      },
       compression_level: 0,
       linked_memories: p.linked_memories ?? [],
       tags: p.tags ?? [],
@@ -362,12 +382,111 @@ async function handleForget(params: unknown, env: Env): Promise<string> {
   }, null, 2);
 }
 
-async function handleTranscript(_params: unknown, _env: Env): Promise<string> {
-  return JSON.stringify({
-    status: "not_implemented",
-    note: "Transcript archive is Phase 2.",
-    results: [],
-  }, null, 2);
+async function handleTranscript(params: unknown, env: Env): Promise<string> {
+  const p = params as {
+    conversation_id?: string;
+    search_query?: string;
+    date_range?: { from?: string; to?: string };
+    limit?: number;
+  };
+  const limit = Math.min(p.limit ?? 5, 20);
+
+  if (p.conversation_id) {
+    const row = await env.TAPROOT_D1
+      .prepare("SELECT id, title, content, conversation_date, created_at FROM transcripts WHERE id = ?")
+      .bind(p.conversation_id)
+      .first<Transcript>();
+    if (!row) {
+      return JSON.stringify({ status: "not_found", conversation_id: p.conversation_id }, null, 2);
+    }
+    return JSON.stringify({ status: "ok", count: 1, results: [row] }, null, 2);
+  }
+
+  if (p.search_query) {
+    // FTS5 snippet: highlight matches in content column (index 2), 40 tokens of context
+    let sql = `
+      SELECT t.id, t.title, t.conversation_date, t.created_at,
+             snippet(transcripts_fts, 2, '[', ']', '…', 40) AS excerpt
+      FROM transcripts_fts f
+      JOIN transcripts t ON t.rowid = f.rowid
+      WHERE transcripts_fts MATCH ?`;
+    const bindings: unknown[] = [p.search_query];
+
+    if (p.date_range?.from) {
+      sql += " AND t.conversation_date >= ?";
+      bindings.push(p.date_range.from);
+    }
+    if (p.date_range?.to) {
+      sql += " AND t.conversation_date <= ?";
+      bindings.push(p.date_range.to);
+    }
+    sql += " ORDER BY rank LIMIT ?";
+    bindings.push(limit);
+
+    const { results } = await env.TAPROOT_D1.prepare(sql).bind(...bindings).all<TranscriptRow>();
+    return JSON.stringify({ status: "ok", count: results.length, results }, null, 2);
+  }
+
+  // List by date range or most-recent
+  let sql = `
+    SELECT id, title, conversation_date, created_at,
+           substr(content, 1, 300) AS excerpt
+    FROM transcripts WHERE 1=1`;
+  const bindings: unknown[] = [];
+
+  if (p.date_range?.from) {
+    sql += " AND conversation_date >= ?";
+    bindings.push(p.date_range.from);
+  }
+  if (p.date_range?.to) {
+    sql += " AND conversation_date <= ?";
+    bindings.push(p.date_range.to);
+  }
+  sql += " ORDER BY coalesce(conversation_date, created_at) DESC LIMIT ?";
+  bindings.push(limit);
+
+  const { results } = await env.TAPROOT_D1.prepare(sql).bind(...bindings).all<TranscriptRow>();
+  return JSON.stringify({ status: "ok", count: results.length, results }, null, 2);
+}
+
+async function handleIngestTranscript(request: Request, env: Env): Promise<Response> {
+  let body: { id?: string; title?: string; content: string; conversation_date?: string };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  if (!body.content || typeof body.content !== "string") {
+    return new Response(JSON.stringify({ error: "content is required" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const id = body.id ?? crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  try {
+    await env.TAPROOT_D1
+      .prepare("INSERT INTO transcripts (id, title, content, conversation_date, created_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, body.title ?? null, body.content, body.conversation_date ?? null, now)
+      .run();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "D1 error";
+    return new Response(JSON.stringify({ error: msg }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify({ status: "ok", id, created_at: now }), {
+    status: 201,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 async function handleStatus(_params: unknown, env: Env): Promise<string> {
@@ -390,13 +509,18 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     }
   }
 
+  const transcriptCount = await env.TAPROOT_D1
+    .prepare("SELECT COUNT(*) AS count FROM transcripts")
+    .first<{ count: number }>();
+
   return JSON.stringify({
     status: "operational",
-    phase: "1",
+    phase: "2",
     storage: "connected",
     memory_counts: counts,
     total_memories: allKeys.length,
     compression_queue: compressionQueue,
+    transcript_archive: { total: transcriptCount?.count ?? 0 },
   }, null, 2);
 }
 
@@ -486,6 +610,12 @@ class TaprootApiHandler extends WorkerEntrypoint<Env> {
 
     if (url.pathname === "/mcp" && request.method === "POST") {
       return handleMcp(request, this.env);
+    }
+
+    // Transcript ingestion: POST /transcripts with JSON body
+    // { id?, title?, content, conversation_date? }
+    if (url.pathname === "/transcripts" && request.method === "POST") {
+      return handleIngestTranscript(request, this.env);
     }
 
     return new Response(JSON.stringify({ error: "Not found" }), {
