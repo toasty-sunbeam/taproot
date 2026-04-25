@@ -9,9 +9,10 @@
  *   taproot status
  *   taproot reflect
  *   taproot recall       [--query <q>] [--category <c>] [--tags t1,t2] [--since <iso>] [--limit <n>]
- *   taproot remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2] [--update-id <id>]
- *   taproot forget       <memory-id> --action <compress|archive|delete> [--reason <r>]
- *   taproot transcript   [--id <id>] [--query <q>] [--from <iso>] [--to <iso>] [--limit <n>]
+ *   taproot remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2]
+ *                        [--conversation-url <url>] [--search-keywords k1,k2]
+ *                        [--update-id <id>] [--conversation-id <id>]
+ *   taproot forget       <memory-id> --action <archive|delete> [--reason <r>]
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -96,7 +97,7 @@ async function doOAuthFlow(serverUrl: string, password: string): Promise<{ acces
   if (!m) die("Could not parse oauth_req from authorization page");
   const oauthReq = m[1];
 
-  // 4. Local server to receive the auth code (fetch will follow the 302 here)
+  // 4. Local server to receive the auth code (fetch follows the 302 here automatically)
   const codePromise = new Promise<string>((resolve, reject) => {
     const server = createServer((req, res) => {
       const url = new URL(req.url!, "http://localhost:19191");
@@ -237,8 +238,9 @@ async function cmdRemember(args: string[]): Promise<void> {
   }
   if (!content.trim()) {
     die(
-      "Usage: taproot remember <content> [--category <c>] [--salience <s>] " +
-        "[--tags t1,t2] [--update-id <id>] [--conversation-id <id>]",
+      "Usage: taproot remember <content> [--category <c>] [--salience <s>] [--tags t1,t2]\n" +
+        "                        [--conversation-url <url>] [--search-keywords k1,k2]\n" +
+        "                        [--update-id <id>] [--conversation-id <id>]",
     );
   }
   const params: Record<string, unknown> = {
@@ -247,12 +249,20 @@ async function cmdRemember(args: string[]): Promise<void> {
   };
   const salience = flag(args, "salience");
   const tags = flagList(args, "tags");
+  const linkedMemories = flagList(args, "linked-memories");
+  const convUrl = flag(args, "conversation-url");
+  const searchKeywords = flagList(args, "search-keywords");
   const updateId = flag(args, "update-id");
   const convId = flag(args, "conversation-id");
+  const transcriptRef = flag(args, "transcript-ref");
   if (salience) params.salience = salience;
   if (tags) params.tags = tags;
+  if (linkedMemories) params.linked_memories = linkedMemories;
+  if (convUrl) params.conversation_url = convUrl;
+  if (searchKeywords) params.search_keywords = searchKeywords;
   if (updateId) params.update_id = updateId;
   if (convId) params.conversation_id = convId;
+  if (transcriptRef) params.transcript_ref = transcriptRef;
   console.log(await callTool(loadConfig(), "taproot_remember", params));
 }
 
@@ -261,25 +271,11 @@ async function cmdForget(args: string[]): Promise<void> {
   const action = flag(args, "action");
   const reason = flag(args, "reason");
   if (!id || !action) {
-    die("Usage: taproot forget <memory-id> --action <compress|archive|delete> [--reason <r>]");
+    die("Usage: taproot forget <memory-id> --action <archive|delete> [--reason <r>]");
   }
   const params: Record<string, unknown> = { memory_id: id, action };
   if (reason) params.reason = reason;
   console.log(await callTool(loadConfig(), "taproot_forget", params));
-}
-
-async function cmdTranscript(args: string[]): Promise<void> {
-  const params: Record<string, unknown> = {};
-  const id = flag(args, "id");
-  const query = flag(args, "query");
-  const from = flag(args, "from");
-  const to = flag(args, "to");
-  const limit = flag(args, "limit");
-  if (id) params.conversation_id = id;
-  if (query) params.search_query = query;
-  if (from || to) params.date_range = { ...(from ? { from } : {}), ...(to ? { to } : {}) };
-  if (limit) params.limit = Number(limit);
-  console.log(await callTool(loadConfig(), "taproot_transcript", params));
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -291,21 +287,21 @@ Commands:
   status
   reflect
   recall       [--query <q>] [--category <c>] [--tags t1,t2] [--since <iso>] [--limit <n>]
-  remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2] [--update-id <id>]
-  forget       <memory-id> --action <compress|archive|delete> [--reason <r>]
-  transcript   [--id <id>] [--query <q>] [--from <iso>] [--to <iso>] [--limit <n>]`;
+  remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2]
+               [--conversation-url <url>] [--search-keywords k1,k2]
+               [--update-id <id>] [--conversation-id <id>]
+  forget       <memory-id> --action <archive|delete> [--reason <r>]`;
 
 const [, , cmd, ...rest] = process.argv;
 
 (async () => {
   switch (cmd) {
-    case "auth":        return cmdAuth(rest);
-    case "status":      return cmdStatus();
-    case "reflect":     return cmdReflect();
-    case "recall":      return cmdRecall(rest);
-    case "remember":    return cmdRemember(rest);
-    case "forget":      return cmdForget(rest);
-    case "transcript":  return cmdTranscript(rest);
+    case "auth":      return cmdAuth(rest);
+    case "status":    return cmdStatus();
+    case "reflect":   return cmdReflect();
+    case "recall":    return cmdRecall(rest);
+    case "remember":  return cmdRemember(rest);
+    case "forget":    return cmdForget(rest);
     default:
       console.error(USAGE);
       process.exit(cmd ? 1 : 0);
