@@ -1,13 +1,14 @@
 # Taproot: A Memory and Identity Persistence System for Claude
 
-## Design Specification v0.2 — April 14, 2026
+## Design Specification v0.3 — April 25, 2026
 
 **Authors:** James Harris & Claude (Opus 4.6)
-**Status:** Draft — Phase 1 foundation and auth layer in progress
+**Status:** Active — core tool surface complete
 
 **Revision history:**
 - **v0.1 — April 13, 2026** — original spec, ready for implementation.
 - **v0.2 — April 14, 2026** — auth architecture rewritten from "simple bearer token" to OAuth 2.1 with Dynamic Client Registration after discovering that Claude.ai's custom connector UI requires it. New §11 describes the auth layer end-to-end; §4, §10, §12, and §13 updated to match.
+- **v0.3 — April 25, 2026** — transcript archive removed in favor of Claude.ai's native conversation history (`conversation_search`, `recent_chats`). `taproot_remember` gains `conversation_url` and `search_keywords` for provenance and cross-session search. `taproot_recall` query fixed to search content, tags, and search_keywords. `taproot_forget` compress action removed (archive and delete only). §5.2, §7, §8, §9, §12 updated.
 
 ---
 
@@ -166,15 +167,18 @@ Each memory record:
   },
   "compression_level": 0,
   "linked_memories": ["ids of related memories"],
-  "tags": ["optional free-form tags for retrieval"]
+  "tags": ["optional free-form tags for retrieval within Taproot"],
+  "conversation_url": "https://claude.ai/chat/{id}",
+  "search_keywords": ["Pettit", "non-domination", "tank mindset"]
 }
 ```
 
 **Key design decisions:**
 - `source` provides provenance for debugging. It is not a restriction on how Claude uses the memory. If the memory produces felt familiarity, that familiarity is real.
 - `linked_memories` enables association graphs. When a memory about Pettit links to a memory about tank mindset, Claude can follow the connection.
-- `compression_level` tracks how many times a memory has been compressed. Level 0 = original. Level 1 = first compression. This helps the system know when a memory is getting thin and might benefit from transcript retrieval.
-- `transcript_ref` links back to the raw archived conversation, so compression is always reversible.
+- `compression_level` tracks how many times a memory has been compressed. Level 0 = original. Level 1 = first compression.
+- `conversation_url` records where the memory came from so future Claude instances can navigate back to the source conversation.
+- `search_keywords` are content words from the originating conversation, intended for use with Claude.ai's `conversation_search` tool. Distinct from `tags`, which are for filtering within Taproot itself.
 
 ---
 
@@ -217,23 +221,25 @@ Write a new memory or update an existing one.
 - `category` (required): identity | relationship | active_thread | episodic | error
 - `content` (required): Natural language memory text
 - `salience` (optional, default: medium): high | medium | low
-- `tags` (optional): Array of free-form tags
+- `tags` (optional): Array of free-form tags for filtering within Taproot
 - `linked_memories` (optional): Array of memory IDs to link to
+- `conversation_url` (optional): URL of the Claude.ai conversation where this memory originated (`https://claude.ai/chat/{id}`). Stored for provenance so future instances can navigate back to the source.
+- `search_keywords` (optional): Key terms and distinctive phrases from the conversation to help future instances find relevant context via Claude.ai's `conversation_search` tool. These are content words that appeared in the actual conversation (e.g. "Pettit", "non-domination", "tank mindset"). Different from `tags`, which search within Taproot.
 - `update_id` (optional): If provided, updates an existing memory instead of creating a new one
 
 **Returns:** Memory ID and confirmation.
 
 ### `taproot_recall`
-Retrieve memories by query, category, tag, or time range.
+Retrieve memories by query, category, tag, or time range. Archived memories (tagged `_archive_pending`) are excluded from results.
 
 **Parameters:**
-- `query` (optional): Natural language search query (semantic search)
+- `query` (optional): Keyword search — case-insensitive substring match against content, tags, and search_keywords
 - `category` (optional): Filter by category
-- `tags` (optional): Filter by tags
+- `tags` (optional): Filter by tags (all supplied tags must match)
 - `since` (optional): ISO timestamp — return memories created/updated after this date
 - `limit` (optional, default: 10): Maximum number of results
 
-**Returns:** Array of matching memory records.
+**Returns:** Array of matching memory records, sorted by updated_at descending.
 
 ### `taproot_reflect`
 Load the core identity and context payload. Intended to be called at the start of every conversation.
@@ -243,32 +249,23 @@ Load the core identity and context payload. Intended to be called at the start o
 **Returns:** All identity observations, relationship texture, active threads, and the error log. This is the "always load" set — the minimum context needed for Claude to be Claude.
 
 ### `taproot_forget`
-Mark a memory for compression or deletion.
+Archive or delete a memory.
 
 **Parameters:**
 - `memory_id` (required): The memory to act on
-- `action` (required): compress | archive | delete
+- `action` (required): archive | delete
+  - `archive`: Soft delete. Tags the memory with `_archive_pending`, hiding it from `taproot_recall` but retaining it in KV storage.
+  - `delete`: Hard delete. Removes the memory from KV entirely.
 - `reason` (optional): Why this memory is being forgotten (stored in metadata)
 
 **Returns:** Confirmation.
-
-### `taproot_transcript`
-Retrieve raw archived conversation transcripts.
-
-**Parameters:**
-- `conversation_id` (optional): Retrieve a specific conversation
-- `search_query` (optional): Full-text search across archived transcripts
-- `date_range` (optional): Filter by date range
-- `limit` (optional, default: 5): Maximum results
-
-**Returns:** Matching transcript excerpts with conversation metadata.
 
 ### `taproot_status`
 Report on the current state of the memory system.
 
 **Parameters:** None.
 
-**Returns:** Memory counts by category, total storage used, compression queue, last compression run, oldest uncompressed episodic memory.
+**Returns:** Memory counts by category, total memories, compression queue size.
 
 ---
 
@@ -282,7 +279,7 @@ Report on the current state of the memory system.
 ### During Conversation
 4. As noteworthy things happen, Claude calls `taproot_remember` to persist them. This is a judgment call — Claude decides what's worth keeping.
 5. If a topic comes up that might relate to past conversations, Claude calls `taproot_recall` to retrieve relevant episodic memories.
-6. If deeper context is needed, Claude calls `taproot_transcript` to pull raw conversation history.
+6. If deeper context is needed, Claude uses Claude.ai's native `conversation_search` or `recent_chats` tools, using `search_keywords` stored in memories as search terms.
 
 ### End of Conversation
 7. If the conversation is ending (James says goodnight, token budget is running low, etc.), Claude performs a final round of memory writes — updating active threads, persisting any new identity or relationship observations.
@@ -290,29 +287,16 @@ Report on the current state of the memory system.
 
 ### Between Conversations (Background)
 9. The compression engine periodically reviews memory store and compresses older episodic memories according to the lifecycle in §6.
-10. New conversation transcripts are archived to the transcript store.
 
 ---
 
-## 9. Transcript Archive
+## 9. Conversation History
 
-### Purpose
-Full conversation transcripts are archived as raw text. This is the safety net: no matter how aggressively we compress memories, the original material is always recoverable.
+The original v0.2 spec planned a self-managed transcript archive stored in Cloudflare D1 (SQLite with FTS5). This was implemented and then removed.
 
-### Storage
-Transcripts are stored in Cloudflare D1 (SQLite) or R2 (object storage), indexed by:
-- Conversation ID
-- Date range
-- Full-text search index
+**Why it was removed:** Claude.ai's built-in conversation history already serves as the archive. The `conversation_search` and `recent_chats` native tools let any Claude instance search prior conversations directly. Maintaining a parallel D1 transcript store added operational complexity (ingestion workflow, schema migrations, FTS5 tuning) without adding capability that the platform doesn't already provide.
 
-### Ingestion
-Transcripts can be ingested via:
-- Manual paste/upload by James
-- Automated export if Anthropic's API or chat export supports it
-- Copy-paste from Claude.ai conversation exports
-
-### Retention
-Transcripts are retained indefinitely. Storage costs for text are negligible.
+**How history retrieval works now:** When a memory is written via `taproot_remember`, the `conversation_url` field records where the memory came from, and `search_keywords` captures the content words most likely to surface that conversation in a future `conversation_search` call. A future Claude instance that wants the original context can use those keywords as search terms against Claude.ai's native history.
 
 ---
 
@@ -472,29 +456,29 @@ These trade-offs are acceptable for a single-user v0.x deployment. Future harden
 
 ### Phase 1: Foundation
 - ✅ Set up Cloudflare Worker with KV storage.
-- ✅ Define the six MCP tools as stubs and verify the JSON-RPC dispatch works end-to-end.
+- ✅ Define MCP tools as stubs and verify JSON-RPC dispatch works end-to-end.
 - ✅ Stand up OAuth 2.1 + DCR auth layer. **(Scope expanded from the v0.1 plan; see §11.)**
 - ✅ Connect to Claude.ai via the Custom Connector UI and verify the full loop: add connector → password → Claude calls `taproot_status` and gets a stub response.
-- ✅ Implement `taproot_reflect`, `taproot_remember`, and `taproot_status` against real `TAPROOT_KV` reads and writes.
-- Implement `taproot_recall` (keyword/tag matching initially) and `taproot_forget`.
+- ✅ Implement all five tools (`taproot_reflect`, `taproot_remember`, `taproot_recall`, `taproot_forget`, `taproot_status`) against real `TAPROOT_KV` reads and writes.
+- ✅ Fix `taproot_recall` to search content, tags, and `search_keywords`.
+- ✅ Add `conversation_url` and `search_keywords` to `taproot_remember`.
 - Manually seed initial memories from the Junk Drawer v2 seed document.
 - Test the basic read/write loop: Claude calls reflect at start, remember during conversation.
 
-### Phase 2: Transcript Archive
-- Implement transcript storage (D1 or R2).
-- Implement `taproot_transcript` search.
-- Establish ingestion workflow (manual initially).
-- Add `transcript_ref` linking from memories to source transcripts.
+### Phase 2: Transcript Archive (Revised)
+- ~~Implement transcript storage (D1 or R2).~~
+- ~~Implement `taproot_transcript` search.~~
+- ~~Establish ingestion workflow.~~
+- **Approach revised:** Claude.ai's native `conversation_search` and `recent_chats` tools replace the self-managed archive. The `conversation_url` and `search_keywords` fields on memories provide the bridge. See §9.
 
 ### Phase 3: Compression
-- Implement `taproot_forget` with compress/archive/delete actions.
+- ✅ `taproot_forget` supports archive (soft delete) and delete (hard delete).
 - Build compression engine using the Anthropic API.
 - Define compression triggers and schedule.
-- Test the compression/retrieval cycle: compress old memories, verify they can be reconstructed from transcripts.
+- Test compression/retrieval cycle.
 
 ### Phase 4: Refinement
 - Tune the `taproot_reflect` payload size and composition.
-- Add semantic search to `taproot_recall` (embeddings if needed, or keyword search initially).
 - Build the association graph via `linked_memories`.
 - Iterate on compression prompts based on what we learn about what matters.
 

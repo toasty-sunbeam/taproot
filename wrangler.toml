@@ -15,15 +15,6 @@ binding = "OAUTH_KV"
 id = "3226757405da43afa1594737360998df"
 preview_id = "b57466b274724adfbd43c6c8216823ac"
 
-# Transcript archive (Phase 2).
-# Create with: wrangler d1 create taproot-transcripts
-# Apply schema: wrangler d1 execute taproot-transcripts --file=migrations/0001_create_transcripts.sql
-# For local dev add to .dev.vars: (no extra vars needed; D1 is auto-wired by wrangler dev)
-[[d1_databases]]
-binding = "TAPROOT_D1"
-database_name = "taproot-transcripts"
-database_id = "2af8aa25-e681-467a-ab6c-cb0d3b684e24"
-
 # Secrets are set via the CLI, not this file:
 #   wrangler secret put TAPROOT_AUTH_TOKEN
 #     — acts as the login password on the OAuth consent screen.

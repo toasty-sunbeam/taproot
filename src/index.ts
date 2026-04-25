@@ -17,7 +17,6 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   TAPROOT_AUTH_TOKEN: string;
   OAUTH_PROVIDER: OAuthHelpers;
-  TAPROOT_D1: D1Database;
 }
 
 // ─── MCP JSON-RPC types ───────────────────────────────────────────────────────
@@ -402,18 +401,12 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     }
   }
 
-  const transcriptCount = await env.TAPROOT_D1
-    .prepare("SELECT COUNT(*) AS count FROM transcripts")
-    .first<{ count: number }>();
-
   return JSON.stringify({
     status: "operational",
-    phase: "2",
     storage: "connected",
     memory_counts: counts,
     total_memories: allKeys.length,
     compression_queue: compressionQueue,
-    transcript_archive: { total: transcriptCount?.count ?? 0 },
   }, null, 2);
 }
 
