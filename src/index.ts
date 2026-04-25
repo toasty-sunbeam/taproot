@@ -311,7 +311,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
   // Filter using metadata to avoid fetching records we'll discard
   let candidates = allKeys;
   // Exclude archived memories from normal recall
-  candidates = candidates.filter(k => !k.metadata?.tags.includes("_archive_pending"));
+  candidates = candidates.filter(k => !k.metadata?.tags?.includes("_archive_pending"));
   if (p.category) {
     candidates = candidates.filter(k => k.metadata?.category === p.category);
   }
