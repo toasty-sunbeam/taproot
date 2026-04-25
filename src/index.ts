@@ -321,7 +321,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
   }
   if (p.tags && p.tags.length > 0) {
     candidates = candidates.filter(k =>
-      p.tags!.every(tag => k.metadata?.tags.includes(tag))
+      p.tags!.every(tag => k.metadata?.tags?.includes(tag))
     );
   }
   if (p.since) {
@@ -504,7 +504,7 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
   for (const k of allKeys) {
     const cat = k.metadata?.category;
     if (cat && cat in counts) counts[cat]++;
-    if (k.metadata?.tags.some(t => t === "_compress_pending" || t === "_archive_pending")) {
+    if (k.metadata?.tags?.some(t => t === "_compress_pending" || t === "_archive_pending")) {
       compressionQueue++;
     }
   }

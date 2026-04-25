@@ -20,7 +20,7 @@ preview_id = "b57466b274724adfbd43c6c8216823ac"
 # Apply schema: wrangler d1 execute taproot-transcripts --file=migrations/0001_create_transcripts.sql
 # For local dev add to .dev.vars: (no extra vars needed; D1 is auto-wired by wrangler dev)
 [[d1_databases]]
-binding = "taproot_transcripts"
+binding = "TAPROOT_D1"
 database_name = "taproot-transcripts"
 database_id = "2af8aa25-e681-467a-ab6c-cb0d3b684e24"
 
