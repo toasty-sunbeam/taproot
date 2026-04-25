@@ -261,7 +261,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
         ...(p.transcript_ref !== undefined ? { transcript_ref: p.transcript_ref } : {}),
       },
       conversation_url: p.conversation_url ?? existing.conversation_url,
-      search_keywords: p.search_keywords ?? existing.search_keywords,
+      search_keywords: Array.isArray(p.search_keywords ?? existing.search_keywords) ? (p.search_keywords ?? existing.search_keywords) : [],
       updated_at: now,
     };
   } else {
@@ -336,7 +336,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
     results = results.filter(m =>
       m.content.toLowerCase().includes(q) ||
       m.tags.some(t => t.toLowerCase().includes(q)) ||
-      (m.search_keywords ?? []).some(kw => kw.toLowerCase().includes(q))
+      (Array.isArray(m.search_keywords) ? m.search_keywords : []).some(kw => kw.toLowerCase().includes(q))
     );
   }
 
