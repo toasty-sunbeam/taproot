@@ -33,22 +33,6 @@ export interface Memory {
   compression_level: number;
   linked_memories: string[];
   tags: string[];
-}
-
-// ─── Transcript types ─────────────────────────────────────────────────────────
-
-export interface Transcript {
-  id: string;
-  title: string | null;
-  content: string;
-  conversation_date: string | null;
-  created_at: string;
-}
-
-export interface TranscriptRow {
-  id: string;
-  title: string | null;
-  conversation_date: string | null;
-  created_at: string;
-  excerpt: string;
+  conversation_url?: string;
+  search_keywords?: string[];
 }
