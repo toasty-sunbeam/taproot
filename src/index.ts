@@ -345,7 +345,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
     results = results.filter(m =>
       m.content.toLowerCase().includes(q) ||
       m.tags.some(t => t.toLowerCase().includes(q)) ||
-      (Array.isArray(m.search_keywords) ? m.search_keywords : []).some(kw => kw.toLowerCase().includes(q))
+      toStringArray(m.search_keywords).some(kw => kw.toLowerCase().includes(q))
     );
   }
 
