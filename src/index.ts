@@ -205,6 +205,15 @@ async function putMemory(kv: KVNamespace, memory: Memory): Promise<void> {
   await kv.put(`mem:${memory.id}`, JSON.stringify(memory), { metadata: meta });
 }
 
+// LLMs occasionally pass array fields as JSON-stringified strings; unwrap them.
+function toStringArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val as string[];
+  if (typeof val === 'string') {
+    try { const parsed = JSON.parse(val); return Array.isArray(parsed) ? parsed : []; } catch { return []; }
+  }
+  return [];
+}
+
 // ─── Tool Handlers ────────────────────────────────────────────────────────────
 
 async function handleReflect(_params: unknown, env: Env): Promise<string> {
@@ -261,7 +270,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
         ...(p.transcript_ref !== undefined ? { transcript_ref: p.transcript_ref } : {}),
       },
       conversation_url: p.conversation_url ?? existing.conversation_url,
-      search_keywords: p.search_keywords ?? existing.search_keywords,
+      search_keywords: p.search_keywords !== undefined ? toStringArray(p.search_keywords) : toStringArray(existing.search_keywords),
       updated_at: now,
     };
   } else {
@@ -281,7 +290,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
       linked_memories: p.linked_memories ?? [],
       tags: p.tags ?? [],
       ...(p.conversation_url !== undefined ? { conversation_url: p.conversation_url } : {}),
-      search_keywords: p.search_keywords ?? [],
+      search_keywords: toStringArray(p.search_keywords),
     };
   }
 
@@ -336,7 +345,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
     results = results.filter(m =>
       m.content.toLowerCase().includes(q) ||
       m.tags.some(t => t.toLowerCase().includes(q)) ||
-      (m.search_keywords ?? []).some(kw => kw.toLowerCase().includes(q))
+      toStringArray(m.search_keywords).some(kw => kw.toLowerCase().includes(q))
     );
   }
 
