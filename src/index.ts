@@ -48,6 +48,7 @@ const TOOLS = [
     description:
       "Load the core identity and context payload. Call at the start of every conversation. Returns all identity observations, relationship texture, active threads, and the error log.",
     inputSchema: { type: "object", properties: {}, required: [] },
+    _meta: { "anthropic/alwaysLoad": true },
   },
   {
     name: "taproot_remember",
