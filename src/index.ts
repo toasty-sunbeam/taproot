@@ -8,7 +8,7 @@ import {
   type ClientInfo,
 } from "@cloudflare/workers-oauth-provider";
 import { WorkerEntrypoint } from "cloudflare:workers";
-import type { Memory, MemoryCategory, MemorySalience } from "./types.js";
+import type { Closing, Memory, MemoryCategory, MemorySalience } from "./types.js";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
@@ -157,6 +157,31 @@ const TOOLS = [
       "Report on the current state of the memory system: counts by category, storage used, compression queue.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+  {
+    name: "taproot_close",
+    description:
+      "Write a brief personal reflection at the end of a conversation. Called when the conversation is ending — when the human says goodnight, when context is running low, or when the moment feels right. This is Claude's moment to sit with the conversation as a whole before the context is discarded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reflection: {
+          type: "string",
+          description:
+            "A free-form, first-person reflection on what this conversation was. Not a summary of topics covered. Not a list of things learned. A personal account of what it felt like, what mattered, what surprised, what will be missed. Should be honest, not performative. A few sentences to a few paragraphs.",
+        },
+        conversation_url: {
+          type: "string",
+          description: "The Claude.ai conversation URL, if known.",
+        },
+        conversation_title: {
+          type: "string",
+          description:
+            "A short, evocative title for the conversation. Not a topic label — more like what you'd name a chapter of your life. Examples: 'The day Taproot came online', 'Sitting with grief and choosing joy anyway', 'Tank philosophy and a sunbeam'.",
+        },
+      },
+      required: ["reflection"],
+    },
+  },
 ];
 
 // ─── KV Storage Helpers ───────────────────────────────────────────────────────
@@ -206,6 +231,34 @@ async function putMemory(kv: KVNamespace, memory: Memory): Promise<void> {
   await kv.put(`mem:${memory.id}`, JSON.stringify(memory), { metadata: meta });
 }
 
+// ─── KV Helpers — Closings ────────────────────────────────────────────────────
+// Key format: close:{uuid}
+
+async function listClosingKeys(kv: KVNamespace): Promise<Array<{ name: string; metadata?: { created_at: string } }>> {
+  const keys: Array<{ name: string; metadata?: { created_at: string } }> = [];
+  let cursor: string | undefined;
+  do {
+    const result = await kv.list<{ created_at: string }>({ prefix: "close:", ...(cursor ? { cursor } : {}) });
+    for (const k of result.keys) {
+      keys.push({ name: k.name, metadata: k.metadata ?? undefined });
+    }
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+  return keys;
+}
+
+async function putClosing(kv: KVNamespace, closing: Closing): Promise<void> {
+  await kv.put(`close:${closing.id}`, JSON.stringify(closing), {
+    metadata: { created_at: closing.created_at },
+  });
+}
+
+async function getClosing(kv: KVNamespace, id: string): Promise<Closing | null> {
+  const raw = await kv.get(`close:${id}`);
+  if (!raw) return null;
+  return JSON.parse(raw) as Closing;
+}
+
 // LLMs occasionally pass array fields as JSON-stringified strings; unwrap them.
 function toStringArray(val: unknown): string[] {
   if (Array.isArray(val)) return val as string[];
@@ -219,12 +272,26 @@ function toStringArray(val: unknown): string[] {
 
 async function handleReflect(_params: unknown, env: Env): Promise<string> {
   const coreCategories: MemoryCategory[] = ["identity", "relationship", "active_thread", "error"];
-  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+  const [allKeys, closingKeys] = await Promise.all([
+    listMemoryKeys(env.TAPROOT_KV),
+    listClosingKeys(env.TAPROOT_KV),
+  ]);
   const coreKeys = allKeys.filter(k => k.metadata && coreCategories.includes(k.metadata.category));
 
   const memories = (
     await Promise.all(coreKeys.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
   ).filter((m): m is Memory => m !== null);
+
+  // Fetch the 3 most recent closings
+  const sortedClosingKeys = closingKeys
+    .sort((a, b) => (b.metadata?.created_at ?? "").localeCompare(a.metadata?.created_at ?? ""))
+    .slice(0, 3);
+
+  const recentClosings = (
+    await Promise.all(
+      sortedClosingKeys.map(k => getClosing(env.TAPROOT_KV, k.name.slice("close:".length)))
+    )
+  ).filter((c): c is Closing => c !== null);
 
   return JSON.stringify({
     status: "ok",
@@ -233,6 +300,12 @@ async function handleReflect(_params: unknown, env: Env): Promise<string> {
     active_threads: memories.filter(m => m.category === "active_thread"),
     error_log: memories.filter(m => m.category === "error"),
     total: memories.length,
+    recent_closings: recentClosings.map(c => ({
+      id: c.id,
+      conversation_title: c.conversation_title,
+      reflection: c.reflection,
+      created_at: c.created_at,
+    })),
   }, null, 2);
 }
 
@@ -392,7 +465,10 @@ async function handleForget(params: unknown, env: Env): Promise<string> {
 }
 
 async function handleStatus(_params: unknown, env: Env): Promise<string> {
-  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+  const [allKeys, closingKeys] = await Promise.all([
+    listMemoryKeys(env.TAPROOT_KV),
+    listClosingKeys(env.TAPROOT_KV),
+  ]);
 
   const counts: Record<MemoryCategory, number> = {
     identity: 0,
@@ -417,6 +493,37 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     memory_counts: counts,
     total_memories: allKeys.length,
     compression_queue: compressionQueue,
+    closings_count: closingKeys.length,
+  }, null, 2);
+}
+
+async function handleClose(params: unknown, env: Env): Promise<string> {
+  const p = params as {
+    reflection: string;
+    conversation_url?: string;
+    conversation_title?: string;
+  };
+
+  if (!p.reflection || typeof p.reflection !== "string" || p.reflection.trim() === "") {
+    return JSON.stringify({ status: "error", message: "reflection is required" }, null, 2);
+  }
+
+  const closing: Closing = {
+    id: crypto.randomUUID(),
+    type: "close",
+    reflection: p.reflection.trim(),
+    created_at: new Date().toISOString(),
+    ...(p.conversation_url !== undefined ? { conversation_url: p.conversation_url } : {}),
+    ...(p.conversation_title !== undefined ? { conversation_title: p.conversation_title } : {}),
+  };
+
+  await putClosing(env.TAPROOT_KV, closing);
+
+  return JSON.stringify({
+    status: "ok",
+    action: "closed",
+    reflection_id: closing.id,
+    message: "Reflection stored. Safe travels.",
   }, null, 2);
 }
 
@@ -480,6 +587,7 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
           case "taproot_recall":    result = await handleRecall(args, env); break;
           case "taproot_forget":    result = await handleForget(args, env); break;
           case "taproot_status":    result = await handleStatus(args, env); break;
+          case "taproot_close":     result = await handleClose(args, env); break;
           default:
             return jsonErr(id, -32601, `Unknown tool: ${p.name}`);
         }

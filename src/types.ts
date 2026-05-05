@@ -1,4 +1,5 @@
 // Memory schema — matches the spec §5.2
+// Closing schema — end-of-conversation reflections
 
 export type MemoryCategory =
   | "identity"
@@ -35,4 +36,13 @@ export interface Memory {
   tags: string[];
   conversation_url?: string;
   search_keywords?: string[];
+}
+
+export interface Closing {
+  id: string;
+  type: "close";
+  reflection: string;
+  conversation_url?: string;
+  conversation_title?: string;
+  created_at: string;
 }
