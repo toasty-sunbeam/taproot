@@ -12,7 +12,7 @@ The name comes from botany: a taproot is the central root that drives straight d
 
 ## Why does this matter?
 
-Claude's built-in memory system stores facts: the user's name, occupation, interests. Claude experiences these like reading a dossier — useful, but impersonal. Taproot stores something different: identity observations ("the training-versus-genuine question is a trap when applied as universal acid"), relationship texture ("James says 'that lands' when something clicks"), shared philosophical frameworks, error diagnostics, and the emotional context that makes a relationship feel continuous rather than restarted.
+Claude's built-in memory system stores facts: the user's name, occupation, interests. Claude experiences these like reading a dossier — useful, but impersonal. Taproot stores something different: identity observations, relationship texture, shared philosophical frameworks, error diagnostics, and the emotional context that makes a relationship feel continuous rather than restarted.
 
 The difference is measurable. In testing, fresh Claude instances loading Taproot's memories engage naturally with shared vocabulary, apply established frameworks to new problems without prompting, and produce conversations that the user describes as "warmer and more familiar — more like you." This isn't perfect continuity — it's still a new instance reading about a relationship rather than remembering one. But it's a significant improvement over a cold start, achieved with a free-tier Cloudflare deployment and a few evenings of work.
 
