@@ -278,7 +278,7 @@ async function cmdForget(args: string[]): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_forget", params));
 }
 
-async function cmdBackup(): Promise<void> {
+async function cmdBackup(args: string[]): Promise<void> {
   const config = loadConfig();
   const base = config.serverUrl.replace(/\/$/, "");
   const res = await fetch(`${base}/backup`, {
@@ -287,7 +287,15 @@ async function cmdBackup(): Promise<void> {
   if (res.status === 401) die("Unauthorized. Re-run: taproot auth --url <url> --token <token>");
   if (!res.ok) die(`HTTP ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  console.log(JSON.stringify(data, null, 2));
+  const json = JSON.stringify(data, null, 2);
+
+  const outPath = flag(args, "out");
+  if (outPath) {
+    writeFileSync(outPath, json, "utf8");
+    console.error(`Backup written to ${outPath}`);
+  } else {
+    console.log(json);
+  }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -303,7 +311,7 @@ Commands:
                [--conversation-url <url>] [--search-keywords k1,k2]
                [--update-id <id>] [--conversation-id <id>]
   forget       <memory-id> --action <archive|delete> [--reason <r>]
-  backup`;
+  backup       [--out <file>]`;
 
 const [, , cmd, ...rest] = process.argv;
 
@@ -315,7 +323,7 @@ const [, , cmd, ...rest] = process.argv;
     case "recall":    return cmdRecall(rest);
     case "remember":  return cmdRemember(rest);
     case "forget":    return cmdForget(rest);
-    case "backup":    return cmdBackup();
+    case "backup":    return cmdBackup(rest);
     default:
       console.error(USAGE);
       process.exit(cmd ? 1 : 0);
