@@ -662,6 +662,10 @@ class TaprootApiHandler extends WorkerEntrypoint<Env> {
       return handleMcp(request, this.env);
     }
 
+    if (url.pathname === "/backup" && request.method === "GET") {
+      return handleBackup(this.env);
+    }
+
     return new Response(JSON.stringify({ error: "Not found" }), {
       status: 404,
       headers: { "Content-Type": "application/json" },
@@ -680,18 +684,6 @@ const defaultHandler: ExportedHandler<Env> = {
       return new Response(JSON.stringify({ status: "ok", server: SERVER_INFO }), {
         headers: { "Content-Type": "application/json" },
       });
-    }
-
-    // Authenticated backup endpoint — exports all KV data as JSON.
-    if (url.pathname === "/backup" && request.method === "GET") {
-      const auth = request.headers.get("Authorization");
-      if (!auth || auth !== `Bearer ${env.TAPROOT_AUTH_TOKEN}`) {
-        return new Response(JSON.stringify({ error: "Unauthorized" }), {
-          status: 401,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return handleBackup(env);
     }
 
     // OAuth authorization flow — password-gated consent screen.
@@ -827,7 +819,7 @@ function escapeHtml(s: string): string {
 // ─── OAuth Provider (default export) ─────────────────────────────────────────
 
 export default new OAuthProvider<Env>({
-  apiRoute: "/mcp",
+  apiRoute: ["/mcp", "/backup"],
   apiHandler: TaprootApiHandler,
   defaultHandler,
   authorizeEndpoint: "/authorize",
