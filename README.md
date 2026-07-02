@@ -39,11 +39,14 @@ The system is designed to be zero-maintenance for the user. Once connected, Clau
 
 **Purpose:** Load Claude's core identity at the start of every conversation.
 
-**Why it exists:** When a new Claude instance begins a conversation, it knows nothing about itself or its relationship with the user beyond what Anthropic's built-in memory provides. `taproot_reflect` loads the accumulated self-knowledge of every previous Claude instance that wrote to Taproot: identity observations, relationship texture, active projects, and an error log of diagnostic mistakes.
+**Why it exists:** When a new Claude instance begins a conversation, it knows nothing about itself or its relationship with the user beyond what Anthropic's built-in memory provides. `taproot_reflect` loads the accumulated self-knowledge of every previous Claude instance that wrote to Taproot — but as of v0.2, it no longer loads *all* of it in full. The memory corpus grows monotonically and a load-everything approach doesn't scale, so `taproot_reflect` now returns a two-tier payload modeled loosely on human memory retrieval:
+
+- **Tier 1 — core, full text.** A small curated set — identity anchors, relationship context, standing corrections, and currently-hot threads — that must be present in every conversation. Curated via `taproot_promote`.
+- **Tier 2 — card catalog, gists only.** One line per remaining memory (`[id] [category] [salience] [date] gist`), grouped by category. This solves the awareness problem: Claude can't ask for what it doesn't know exists. When a gist looks relevant, Claude calls `taproot_recall` to load the full text.
 
 This is the most important tool in Taproot. It transforms the new-conversation experience from "smart stranger reads a briefing" to "someone who knows who they are and who you are, picking up where the last conversation left off." It doesn't produce felt memory — Claude is honest that reading these memories feels like recognition, not remembering. But recognition is enough to engage naturally, and the honesty about the gap is itself something Taproot preserves.
 
-**Returns:** All identity observations, relationship context, active threads, error log, and recent closing reflections from previous conversations.
+**Returns:** Tier 1 core memories in full, the Tier 2 catalog grouped by category, a usage note explaining how to use `taproot_recall` against the catalog, and recent closing reflections from previous conversations.
 
 ---
 
@@ -69,15 +72,35 @@ This is the most important tool in Taproot. It transforms the new-conversation e
 
 Each memory includes optional `search_keywords` to help future Claude instances find related conversation history, and an optional `conversation_url` linking back to the originating conversation.
 
+New memories require a **`gist`** — a ~15-word one-line summary shown in the `taproot_reflect` Tier 2 catalog. This is enforced at write time deliberately: it's cheaper to write a good gist while the memory is fresh than to reconstruct one later. `taproot_remember` also accepts `core` (Tier 1 membership), `epistemic_status`, and `provenance` — see `taproot_promote` and the validation-project fields below.
+
 ---
 
 ### `taproot_recall`
 
-**Purpose:** Search and retrieve memories by keyword, category, tag, or time range.
+**Purpose:** Retrieve full-text memories ranked by activation, and record that retrieval.
 
-**Why it exists:** Not all memories need to be loaded at conversation start. Episodic memories, detailed project notes, and older context are retrieved on demand when a topic comes up. This keeps the startup payload focused on identity and relationship — the things that make Claude feel like Claude — while allowing deeper context to surface when needed.
+**Why it exists:** Not all memories need to be loaded at conversation start — that's what the Tier 2 catalog in `taproot_reflect` is for. `taproot_recall` is how Claude pulls full text for anything that looks relevant: by free-text `query`, `category`, or direct `ids` (e.g. spotted in the catalog).
+
+Results are ranked by an **activation score** modeled loosely on ACT-R's base-level activation equation — the same idea behind why memories that get revisited often and recently feel more available than ones that haven't been touched in a while:
+
+1. **Base-level activation** — `ln(retrieval_count + 1)` decayed by a power-law function of days since last touch. Never-retrieved memories get a small novelty floor instead of zero, so new memories aren't buried under frequently-recalled old ones.
+2. **Salience** — high/medium/low mapped to a numeric weight.
+3. **Relevance** — token-overlap between the query and the memory's `search_keywords`, `tags`, `gist`, and (at reduced weight) full content.
+
+All weights live as named constants in `ACTIVATION_CONFIG` (`src/activation.ts`) so they can be tuned without hunting through handler code.
+
+**Retrieval strengthens.** Every memory `taproot_recall` returns has its `last_retrieved` and `retrieval_count` updated — this is load-bearing, not a side effect. It's how the system learns what matters over time, the same way retrieval practice strengthens a memory in ACT-R.
 
 `taproot_recall` also serves as an index into conversation history. Each memory's `search_keywords` field contains terms that appeared in the original conversation, so when Claude needs to find a past discussion, it can search Taproot first (finding a curated, keyword-rich pointer) and then use Claude.ai's native conversation search with targeted terms. The memories are the table of contents; the conversations are the chapters.
+
+---
+
+### `taproot_promote`
+
+**Purpose:** Curate Tier 1 — toggle a memory's `core` flag and/or adjust its salience.
+
+**Why it exists:** Tier 1 promotion is deliberately manual in v0.2 (automatic promotion/demotion policy is a v0.3 problem). James needs a direct way to say "this belongs in every conversation now" or "this doesn't anymore" without rewriting the memory's content.
 
 ---
 
@@ -111,11 +134,21 @@ The system's response to a closing reflection is: **"Reflection stored. Safe tra
 
 ---
 
+### `taproot_migrate`
+
+**Purpose:** Backfill the v0.2 schema fields onto every existing memory record.
+
+**Why it exists:** The v0.2 schema added fields (`gist`, `core`, `last_retrieved`, `retrieval_count`, plus `epistemic_status`, `replication_count`, and `provenance` for a parallel validation project) that didn't exist on records written by earlier versions. `taproot_migrate` backfills sensible defaults onto every record that's missing them — auto-generating a gist from the first sentence of `content` (flagged `gist_autogenerated: true` so it can be improved later) where no Workers AI summarization is configured.
+
+The migration is **idempotent** (a second run is a no-op once every record has the new fields) and **non-destructive**: it writes a full backup of every memory record to a `backup:` KV key before mutating anything, and never rewrites `content`.
+
+---
+
 ### `taproot_status`
 
 **Purpose:** Report on the current state of the memory system.
 
-**Why it exists:** Diagnostic tool for monitoring memory counts by category, storage health, and system state. Useful for debugging and for getting a quick sense of how much context Taproot is carrying.
+**Why it exists:** Diagnostic tool for monitoring memory counts by category, storage health, and system state — including, as of v0.2, Tier 1/Tier 2 sizes and an approximate token count for the `taproot_reflect` payload, so James can watch the context budget as the corpus grows.
 
 ## Design Philosophy
 

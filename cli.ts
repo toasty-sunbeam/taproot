@@ -8,11 +8,15 @@
  * Then:
  *   taproot status
  *   taproot reflect
- *   taproot recall       [--query <q>] [--category <c>] [--tags t1,t2] [--since <iso>] [--limit <n>]
- *   taproot remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2]
+ *   taproot recall       [--query <q>] [--category <c>] [--ids id1,id2] [--tags t1,t2]
+ *                        [--since <iso>] [--limit <n>]
+ *   taproot remember     <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]
+ *                        [--core] [--epistemic-status <s>] [--provenance <p>]
  *                        [--conversation-url <url>] [--search-keywords k1,k2]
  *                        [--update-id <id>] [--conversation-id <id>]
  *   taproot forget       <memory-id> --action <archive|delete> [--reason <r>]
+ *   taproot promote      <memory-id> [--core <true|false>] [--salience <s>]
+ *   taproot migrate
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -191,6 +195,14 @@ function flagList(args: string[], name: string): string[] | undefined {
   return v ? v.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
 }
 
+function boolFlag(args: string[], name: string): boolean | undefined {
+  const i = args.indexOf(`--${name}`);
+  if (i === -1) return undefined;
+  const next = args[i + 1];
+  if (next === "true" || next === "false") return next === "true";
+  return true;
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 async function cmdAuth(args: string[]): Promise<void> {
@@ -215,11 +227,13 @@ async function cmdRecall(args: string[]): Promise<void> {
   const params: Record<string, unknown> = {};
   const query = flag(args, "query");
   const category = flag(args, "category");
+  const ids = flagList(args, "ids");
   const tags = flagList(args, "tags");
   const since = flag(args, "since");
   const limit = flag(args, "limit");
   if (query) params.query = query;
   if (category) params.category = category;
+  if (ids) params.ids = ids;
   if (tags) params.tags = tags;
   if (since) params.since = since;
   if (limit) params.limit = Number(limit);
@@ -238,7 +252,8 @@ async function cmdRemember(args: string[]): Promise<void> {
   }
   if (!content.trim()) {
     die(
-      "Usage: taproot remember <content> [--category <c>] [--salience <s>] [--tags t1,t2]\n" +
+      "Usage: taproot remember <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]\n" +
+        "                        [--core] [--epistemic-status <s>] [--provenance <p>]\n" +
         "                        [--conversation-url <url>] [--search-keywords k1,k2]\n" +
         "                        [--update-id <id>] [--conversation-id <id>]",
     );
@@ -247,7 +262,11 @@ async function cmdRemember(args: string[]): Promise<void> {
     content,
     category: flag(args, "category") ?? "episodic",
   };
+  const gist = flag(args, "gist");
   const salience = flag(args, "salience");
+  const core = boolFlag(args, "core");
+  const epistemicStatus = flag(args, "epistemic-status");
+  const provenance = flag(args, "provenance");
   const tags = flagList(args, "tags");
   const linkedMemories = flagList(args, "linked-memories");
   const convUrl = flag(args, "conversation-url");
@@ -255,7 +274,12 @@ async function cmdRemember(args: string[]): Promise<void> {
   const updateId = flag(args, "update-id");
   const convId = flag(args, "conversation-id");
   const transcriptRef = flag(args, "transcript-ref");
+  if (gist) params.gist = gist;
+  else if (!updateId) die("--gist is required when creating a new memory (a ~15-word one-line summary)");
   if (salience) params.salience = salience;
+  if (core !== undefined) params.core = core;
+  if (epistemicStatus) params.epistemic_status = epistemicStatus;
+  if (provenance) params.provenance = provenance;
   if (tags) params.tags = tags;
   if (linkedMemories) params.linked_memories = linkedMemories;
   if (convUrl) params.conversation_url = convUrl;
@@ -278,6 +302,23 @@ async function cmdForget(args: string[]): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_forget", params));
 }
 
+async function cmdPromote(args: string[]): Promise<void> {
+  const id = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
+  const core = boolFlag(args, "core");
+  const salience = flag(args, "salience");
+  if (!id || (core === undefined && !salience)) {
+    die("Usage: taproot promote <memory-id> [--core <true|false>] [--salience <s>]");
+  }
+  const params: Record<string, unknown> = { memory_id: id };
+  if (core !== undefined) params.core = core;
+  if (salience) params.salience = salience;
+  console.log(await callTool(loadConfig(), "taproot_promote", params));
+}
+
+async function cmdMigrate(): Promise<void> {
+  console.log(await callTool(loadConfig(), "taproot_migrate"));
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const USAGE = `Usage: taproot <command> [options]
@@ -286,11 +327,15 @@ Commands:
   auth         --url <server-url> --token <auth-token>
   status
   reflect
-  recall       [--query <q>] [--category <c>] [--tags t1,t2] [--since <iso>] [--limit <n>]
-  remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2]
+  recall       [--query <q>] [--category <c>] [--ids id1,id2] [--tags t1,t2]
+               [--since <iso>] [--limit <n>]
+  remember     <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]
+               [--core] [--epistemic-status <s>] [--provenance <p>]
                [--conversation-url <url>] [--search-keywords k1,k2]
                [--update-id <id>] [--conversation-id <id>]
-  forget       <memory-id> --action <archive|delete> [--reason <r>]`;
+  forget       <memory-id> --action <archive|delete> [--reason <r>]
+  promote      <memory-id> [--core <true|false>] [--salience <s>]
+  migrate`;
 
 const [, , cmd, ...rest] = process.argv;
 
@@ -302,6 +347,8 @@ const [, , cmd, ...rest] = process.argv;
     case "recall":    return cmdRecall(rest);
     case "remember":  return cmdRemember(rest);
     case "forget":    return cmdForget(rest);
+    case "promote":   return cmdPromote(rest);
+    case "migrate":   return cmdMigrate();
     default:
       console.error(USAGE);
       process.exit(cmd ? 1 : 0);
