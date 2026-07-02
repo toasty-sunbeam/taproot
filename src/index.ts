@@ -883,6 +883,53 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// ─── Backup Handler ─────────────────────────────────────────────────────────
+
+async function handleBackup(env: Env): Promise<Response> {
+  const entries: Array<{
+    key: string;
+    value: unknown;
+    metadata: unknown;
+    error?: string;
+  }> = [];
+
+  let cursor: string | undefined;
+  do {
+    const listed = await env.TAPROOT_KV.list({ limit: 1000, cursor });
+    for (const { name } of listed.keys) {
+      try {
+        const { value, metadata } = await env.TAPROOT_KV.getWithMetadata(name, "text");
+        let parsed: unknown = value;
+        if (typeof value === "string") {
+          try {
+            parsed = JSON.parse(value);
+          } catch {
+            // keep as raw string
+          }
+        }
+        entries.push({ key: name, value: parsed, metadata: metadata ?? null });
+      } catch (err) {
+        entries.push({
+          key: name,
+          value: null,
+          metadata: null,
+          error: err instanceof Error ? err.message : "Unknown error",
+        });
+      }
+    }
+    cursor = listed.list_complete ? undefined : listed.cursor;
+  } while (cursor);
+
+  return new Response(
+    JSON.stringify({
+      exported_at: new Date().toISOString(),
+      total_keys: entries.length,
+      entries,
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
+}
+
 // ─── API Handler (authenticated requests) ───────────────────────────────────
 // The OAuth provider validates the access token before calling this.
 
@@ -892,6 +939,10 @@ class TaprootApiHandler extends WorkerEntrypoint<Env> {
 
     if (url.pathname === "/mcp" && request.method === "POST") {
       return handleMcp(request, this.env);
+    }
+
+    if (url.pathname === "/backup" && request.method === "GET") {
+      return handleBackup(this.env);
     }
 
     return new Response(JSON.stringify({ error: "Not found" }), {
@@ -1047,7 +1098,7 @@ function escapeHtml(s: string): string {
 // ─── OAuth Provider (default export) ─────────────────────────────────────────
 
 export default new OAuthProvider<Env>({
-  apiRoute: "/mcp",
+  apiRoute: ["/mcp", "/backup"],
   apiHandler: TaprootApiHandler,
   defaultHandler,
   authorizeEndpoint: "/authorize",

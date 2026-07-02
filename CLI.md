@@ -106,6 +106,19 @@ Backfill v0.2 schema fields (`gist`, `core`, `last_retrieved`, `retrieval_count`
 npm run taproot -- migrate
 ```
 
+#### `taproot backup`
+
+Export all KV data as a JSON snapshot. Prints to stdout by default, or writes to a file with `--out`.
+
+```bash
+npm run taproot -- backup
+npm run taproot -- backup --out ~/taproot-backup.json
+```
+
+| Flag | Description |
+|---|---|
+| `--out` | File path to write the backup to (omit to print to stdout) |
+
 ### Output
 
 All commands print the JSON response to stdout, pretty-printed. This is the exact payload Claude receives from the MCP server — the content of the `text` field in the MCP tool result.

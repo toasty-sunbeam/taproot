@@ -17,6 +17,7 @@
  *   taproot forget       <memory-id> --action <archive|delete> [--reason <r>]
  *   taproot promote      <memory-id> [--core <true|false>] [--salience <s>]
  *   taproot migrate
+ *   taproot backup       [--out <file>]
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -319,6 +320,26 @@ async function cmdMigrate(): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_migrate"));
 }
 
+async function cmdBackup(args: string[]): Promise<void> {
+  const config = loadConfig();
+  const base = config.serverUrl.replace(/\/$/, "");
+  const res = await fetch(`${base}/backup`, {
+    headers: { Authorization: `Bearer ${config.accessToken}` },
+  });
+  if (res.status === 401) die("Unauthorized. Re-run: taproot auth --url <url> --token <token>");
+  if (!res.ok) die(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const json = JSON.stringify(data, null, 2);
+
+  const outPath = flag(args, "out");
+  if (outPath) {
+    writeFileSync(outPath, json, "utf8");
+    console.error(`Backup written to ${outPath}`);
+  } else {
+    console.log(json);
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const USAGE = `Usage: taproot <command> [options]
@@ -335,7 +356,8 @@ Commands:
                [--update-id <id>] [--conversation-id <id>]
   forget       <memory-id> --action <archive|delete> [--reason <r>]
   promote      <memory-id> [--core <true|false>] [--salience <s>]
-  migrate`;
+  migrate
+  backup       [--out <file>]`;
 
 const [, , cmd, ...rest] = process.argv;
 
@@ -349,6 +371,7 @@ const [, , cmd, ...rest] = process.argv;
     case "forget":    return cmdForget(rest);
     case "promote":   return cmdPromote(rest);
     case "migrate":   return cmdMigrate();
+    case "backup":    return cmdBackup(rest);
     default:
       console.error(USAGE);
       process.exit(cmd ? 1 : 0);
