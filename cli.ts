@@ -278,6 +278,18 @@ async function cmdForget(args: string[]): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_forget", params));
 }
 
+async function cmdBackup(): Promise<void> {
+  const config = loadConfig();
+  const base = config.serverUrl.replace(/\/$/, "");
+  const res = await fetch(`${base}/backup`, {
+    headers: { Authorization: `Bearer ${config.accessToken}` },
+  });
+  if (res.status === 401) die("Unauthorized. Re-run: taproot auth --url <url> --token <token>");
+  if (!res.ok) die(`HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  console.log(JSON.stringify(data, null, 2));
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const USAGE = `Usage: taproot <command> [options]
@@ -290,7 +302,8 @@ Commands:
   remember     <content> [--category <c>] [--salience <s>] [--tags t1,t2]
                [--conversation-url <url>] [--search-keywords k1,k2]
                [--update-id <id>] [--conversation-id <id>]
-  forget       <memory-id> --action <archive|delete> [--reason <r>]`;
+  forget       <memory-id> --action <archive|delete> [--reason <r>]
+  backup`;
 
 const [, , cmd, ...rest] = process.argv;
 
@@ -302,6 +315,7 @@ const [, , cmd, ...rest] = process.argv;
     case "recall":    return cmdRecall(rest);
     case "remember":  return cmdRemember(rest);
     case "forget":    return cmdForget(rest);
+    case "backup":    return cmdBackup();
     default:
       console.error(USAGE);
       process.exit(cmd ? 1 : 0);
