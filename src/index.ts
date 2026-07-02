@@ -604,6 +604,53 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// ─── Backup Handler ─────────────────────────────────────────────────────────
+
+async function handleBackup(env: Env): Promise<Response> {
+  const entries: Array<{
+    key: string;
+    value: unknown;
+    metadata: unknown;
+    error?: string;
+  }> = [];
+
+  let cursor: string | undefined;
+  do {
+    const listed = await env.TAPROOT_KV.list({ limit: 1000, cursor });
+    for (const { name } of listed.keys) {
+      try {
+        const { value, metadata } = await env.TAPROOT_KV.getWithMetadata(name, "text");
+        let parsed: unknown = value;
+        if (typeof value === "string") {
+          try {
+            parsed = JSON.parse(value);
+          } catch {
+            // keep as raw string
+          }
+        }
+        entries.push({ key: name, value: parsed, metadata: metadata ?? null });
+      } catch (err) {
+        entries.push({
+          key: name,
+          value: null,
+          metadata: null,
+          error: err instanceof Error ? err.message : "Unknown error",
+        });
+      }
+    }
+    cursor = listed.list_complete ? undefined : listed.cursor;
+  } while (cursor);
+
+  return new Response(
+    JSON.stringify({
+      exported_at: new Date().toISOString(),
+      total_keys: entries.length,
+      entries,
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
+}
+
 // ─── API Handler (authenticated requests) ───────────────────────────────────
 // The OAuth provider validates the access token before calling this.
 
@@ -633,6 +680,18 @@ const defaultHandler: ExportedHandler<Env> = {
       return new Response(JSON.stringify({ status: "ok", server: SERVER_INFO }), {
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // Authenticated backup endpoint — exports all KV data as JSON.
+    if (url.pathname === "/backup" && request.method === "GET") {
+      const auth = request.headers.get("Authorization");
+      if (!auth || auth !== `Bearer ${env.TAPROOT_AUTH_TOKEN}`) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return handleBackup(env);
     }
 
     // OAuth authorization flow — password-gated consent screen.
