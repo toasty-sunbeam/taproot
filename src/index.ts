@@ -38,7 +38,7 @@ interface JsonRpcResponse {
 
 // ─── MCP Metadata ─────────────────────────────────────────────────────────────
 
-const SERVER_INFO = { name: "taproot", version: "0.2.0" };
+const SERVER_INFO = { name: "taproot", version: "0.3.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 
 // ─── Tool Definitions (MCP schema) ───────────────────────────────────────────
@@ -47,7 +47,7 @@ const TOOLS = [
   {
     name: "taproot_reflect",
     description:
-      "Load the core identity and context payload. Call at the start of every conversation. Returns two tiers: (1) core memories in full text — identity anchors, relationship context, standing corrections, and hot threads; (2) a one-line gist catalog of every other memory, grouped by category, so you know what exists even though you haven't loaded it. Use taproot_recall to pull full text for anything in the catalog that looks relevant.",
+      "Load the core identity and context payload. Call at the start of every conversation. Returns two tiers: (1) core memories in full text — identity anchors, relationship context, standing corrections, and hot threads; (2) a one-line gist catalog of every high-salience or recently-touched memory, grouped by category, plus per-category counts of what was omitted, so you know what exists even though you haven't loaded it. Use taproot_recall (by query, category, or id) to pull full text for anything in the catalog — or anything omitted from it — that looks relevant.",
     inputSchema: { type: "object", properties: {}, required: [] },
     _meta: { "anthropic/alwaysLoad": true },
   },
@@ -199,7 +199,7 @@ const TOOLS = [
   {
     name: "taproot_migrate",
     description:
-      "Admin: backfill v0.2 schema fields (gist, core, last_retrieved, retrieval_count, epistemic_status, replication_count, provenance) onto every existing memory record. Idempotent — safe to run more than once. Writes a full backup of all memory records to KV before mutating anything, and never touches memory content.",
+      "Admin: backfill v0.2 schema fields (gist, core, last_retrieved, retrieval_count, epistemic_status, replication_count, provenance) and normalize v0.3 category/salience drift onto every existing memory record. Idempotent — safe to run more than once. Writes a full backup of all memory records to KV before mutating anything, and never touches memory content.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -352,7 +352,82 @@ function toStringArray(val: unknown): string[] {
   return [];
 }
 
+// ─── Category & Salience Normalization (v0.3) ────────────────────────────────
+// The store drifted from the canonical enums before validation was enforced
+// at write time. These map the drifted values back onto the canonical set —
+// used by both the one-time migration (taproot_migrate) and the write-time
+// guard in taproot_remember below.
+
+const CANONICAL_CATEGORIES = new Set<MemoryCategory>([
+  "identity", "relationship", "active_thread", "episodic", "error",
+]);
+
+const LEGACY_CATEGORY_MAP: Record<string, MemoryCategory> = {
+  active_threads: "active_thread",
+  identity_observations: "identity",
+  relationship_texture: "relationship",
+  event: "episodic",
+  project: "active_thread",
+  completed_project: "episodic",
+  // The one known "undefined" entry is tool-limitation knowledge — exactly
+  // what the error category is for.
+  undefined: "error",
+};
+
+function isCanonicalSalience(s: unknown): s is MemorySalience {
+  return s === "high" || s === "medium" || s === "low";
+}
+
+// "3"/"2"/"1" (string or number) observed in drifted records.
+function numericSalience(raw: unknown): MemorySalience | null {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (n === 3) return "high";
+  if (n === 2) return "medium";
+  if (n === 1) return "low";
+  return null;
+}
+
+// Migration-time: normalizes whatever is sitting in storage. Never fails —
+// anything unmapped defaults to "error" (category) or "medium" (salience)
+// so one bad record can't block the batch.
+function migrateCategory(raw: unknown): MemoryCategory {
+  if (typeof raw === "string" && CANONICAL_CATEGORIES.has(raw as MemoryCategory)) return raw as MemoryCategory;
+  if (typeof raw === "string" && raw in LEGACY_CATEGORY_MAP) return LEGACY_CATEGORY_MAP[raw];
+  return "error";
+}
+
+function migrateSalience(raw: unknown): MemorySalience {
+  if (isCanonicalSalience(raw)) return raw;
+  return numericSalience(raw) ?? "medium";
+}
+
+// Write-time (taproot_remember): known legacy strings are coerced with a
+// warning in the response; anything unrecognized is rejected outright so
+// new drift can't creep back in.
+function resolveCategory(raw: string): { category: MemoryCategory; coerced: boolean } | null {
+  if (CANONICAL_CATEGORIES.has(raw as MemoryCategory)) return { category: raw as MemoryCategory, coerced: false };
+  if (raw in LEGACY_CATEGORY_MAP) return { category: LEGACY_CATEGORY_MAP[raw], coerced: true };
+  return null;
+}
+
+function resolveSalience(raw: string): { salience: MemorySalience; coerced: boolean } | null {
+  if (isCanonicalSalience(raw)) return { salience: raw, coerced: false };
+  const n = numericSalience(raw);
+  return n ? { salience: n, coerced: true } : null;
+}
+
 // ─── Tool Handlers ────────────────────────────────────────────────────────────
+
+// v0.3 — tunable knobs for the reflect payload. Lives here (rather than
+// ACTIVATION_CONFIG in activation.ts) because it governs catalog windowing,
+// not recall scoring.
+const REFLECT_CONFIG = {
+  // A catalog line is included only if its memory is high-salience or was
+  // touched (updated or retrieved) within this many days. Everything else
+  // is rolled up into catalog_omitted per-category counts instead — still
+  // reachable via taproot_recall, just not itemized on every reflect call.
+  CATALOG_WINDOW_DAYS: 45,
+} as const;
 
 // One line per catalog entry: "[id] [category] [salience] [date] gist".
 // Terse on purpose — this is the Tier 2 payload, and its whole point is to
@@ -363,15 +438,62 @@ function catalogLine(id: string, meta: MemoryMeta): string {
   return `[${id}] [${meta.category}] [${meta.salience}] [${date}] ${gist}`;
 }
 
+// A memory earns a spot in the reflect catalog if it's high-salience (always
+// worth surfacing) or was touched recently enough to still be "live". Older,
+// lower-salience memories are omitted from the catalog listing but remain
+// fully searchable via taproot_recall.
+function withinCatalogWindow(dateStr: string | null | undefined, cutoffMs: number): boolean {
+  if (!dateStr) return false;
+  const t = new Date(dateStr).getTime();
+  return !Number.isNaN(t) && t >= cutoffMs;
+}
+
+function inCatalogWindow(
+  salience: MemorySalience,
+  updatedAt: string | null | undefined,
+  lastRetrieved: string | null | undefined,
+  cutoffMs: number,
+): boolean {
+  if (salience === "high") return true;
+  return withinCatalogWindow(updatedAt, cutoffMs) || withinCatalogWindow(lastRetrieved, cutoffMs);
+}
+
 const CATEGORY_ORDER: MemoryCategory[] = ["identity", "relationship", "active_thread", "error", "episodic"];
+
+// Slim wire format for Tier 1 (reflect only — taproot_recall still returns
+// full records). Drops bookkeeping fields (search_keywords, provenance,
+// retrieval_count, last_retrieved, gist_autogenerated, compression_level,
+// source, epistemic_status, replication_count, created_at) that reflect's
+// caller has no use for on every conversation start.
+interface CoreMemoryWire {
+  id: string;
+  category: MemoryCategory;
+  salience: MemorySalience;
+  content: string;
+  updated_at: string;
+  linked_memories?: string[];
+}
+
+function serializeCoreMemory(m: Memory): CoreMemoryWire {
+  return {
+    id: m.id,
+    category: m.category,
+    salience: m.salience,
+    content: m.content,
+    updated_at: m.updated_at,
+    ...(m.linked_memories && m.linked_memories.length > 0 ? { linked_memories: m.linked_memories } : {}),
+  };
+}
 
 interface ReflectPayload {
   status: "ok";
   usage_note: string;
-  core_memories: Record<string, Memory[]>;
+  core_memories: Record<string, CoreMemoryWire[]>;
   core_count: number;
   catalog: Record<string, string[]>;
   catalog_count: number;
+  catalog_omitted: Record<string, number>;
+  catalog_note: string;
   recent_closings: Array<{ id: string; conversation_title?: string; reflection: string; created_at: string }>;
 }
 
@@ -389,12 +511,17 @@ async function buildReflectPayload(env: Env): Promise<ReflectPayload> {
     await Promise.all(coreKeys.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
   ).filter((m): m is Memory => m !== null);
 
-  const coreByCategory: Record<string, Memory[]> = {};
+  const coreByCategory: Record<string, CoreMemoryWire[]> = {};
   for (const cat of CATEGORY_ORDER) coreByCategory[cat] = [];
-  for (const m of coreMemories) (coreByCategory[m.category] ??= []).push(m);
+  for (const m of coreMemories) (coreByCategory[m.category] ??= []).push(serializeCoreMemory(m));
 
   const catalogByCategory: Record<string, string[]> = {};
-  for (const cat of CATEGORY_ORDER) catalogByCategory[cat] = [];
+  const catalogOmitted: Record<string, number> = {};
+  for (const cat of CATEGORY_ORDER) {
+    catalogByCategory[cat] = [];
+    catalogOmitted[cat] = 0;
+  }
+  const cutoffMs = Date.now() - REFLECT_CONFIG.CATALOG_WINDOW_DAYS * 86_400_000;
   // Fast path: build the line from KV list metadata (no full fetch). Records
   // with missing/incomplete metadata (e.g. never migrated, or edited outside
   // putMemory) fall back to a full fetch so nothing goes missing from the
@@ -404,14 +531,22 @@ async function buildReflectPayload(env: Env): Promise<ReflectPayload> {
     await Promise.all(metadataless.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
   ).filter((m): m is Memory => m !== null);
   for (const m of fallbackMemories) {
-    (catalogByCategory[m.category] ??= []).push(
-      catalogLine(m.id, { category: m.category, salience: m.salience, created_at: m.created_at, updated_at: m.updated_at, tags: m.tags, gist: m.gist, core: m.core, last_retrieved: m.last_retrieved }),
-    );
+    if (inCatalogWindow(m.salience, m.updated_at, m.last_retrieved, cutoffMs)) {
+      (catalogByCategory[m.category] ??= []).push(
+        catalogLine(m.id, { category: m.category, salience: m.salience, created_at: m.created_at, updated_at: m.updated_at, tags: m.tags, gist: m.gist, core: m.core, last_retrieved: m.last_retrieved }),
+      );
+    } else {
+      catalogOmitted[m.category] = (catalogOmitted[m.category] ?? 0) + 1;
+    }
   }
   for (const k of catalogKeys) {
     if (!k.metadata) continue;
     const id = idFromKey(k.name);
-    (catalogByCategory[k.metadata.category] ??= []).push(catalogLine(id, k.metadata));
+    if (inCatalogWindow(k.metadata.salience, k.metadata.updated_at, k.metadata.last_retrieved, cutoffMs)) {
+      (catalogByCategory[k.metadata.category] ??= []).push(catalogLine(id, k.metadata));
+    } else {
+      catalogOmitted[k.metadata.category] = (catalogOmitted[k.metadata.category] ?? 0) + 1;
+    }
   }
 
   const sortedClosingKeys = closingKeys
@@ -423,14 +558,18 @@ async function buildReflectPayload(env: Env): Promise<ReflectPayload> {
     )
   ).filter((c): c is Closing => c !== null);
 
+  const catalogCount = CATEGORY_ORDER.reduce((sum, cat) => sum + (catalogByCategory[cat]?.length ?? 0), 0);
+
   return {
     status: "ok",
     usage_note:
-      "Tier 1 (core_memories) is full text, loaded every conversation: identity anchors, relationship context, standing corrections, and hot threads. Tier 2 (catalog) is one gist line per remaining memory, grouped by category — a table of contents, not the content. When a gist looks relevant, call taproot_recall with a query (matched against keywords/tags/gist/content) or with ids (direct fetch of catalog entries) to load full text. Every recall strengthens that memory for future retrieval.",
+      "Tier 1 (core_memories) is full text, loaded every conversation: identity anchors, relationship context, standing corrections, and hot threads. Tier 2 (catalog) is one gist line per remaining memory that's high-salience or touched recently, grouped by category — a table of contents, not the content. When a gist looks relevant, call taproot_recall with a query (matched against keywords/tags/gist/content) or with ids (direct fetch of catalog entries) to load full text. Every recall strengthens that memory for future retrieval.",
     core_memories: coreByCategory,
     core_count: coreMemories.length,
     catalog: catalogByCategory,
-    catalog_count: catalogKeys.length,
+    catalog_count: catalogCount,
+    catalog_omitted: catalogOmitted,
+    catalog_note: `Omitted entries are lower-salience and untouched >${REFLECT_CONFIG.CATALOG_WINDOW_DAYS} days. Retrieve via taproot_recall(query|category|ids).`,
     recent_closings: recentClosings.map(c => ({
       id: c.id,
       conversation_title: c.conversation_title,
@@ -447,10 +586,10 @@ async function handleReflect(_params: unknown, env: Env): Promise<string> {
 
 async function handleRemember(params: unknown, env: Env): Promise<string> {
   const p = params as {
-    category: MemoryCategory;
+    category: string;
     content: string;
     gist?: string;
-    salience?: MemorySalience;
+    salience?: string;
     core?: boolean;
     epistemic_status?: EpistemicStatus;
     provenance?: string;
@@ -463,6 +602,29 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     update_id?: string;
   };
 
+  const resolvedCategory = typeof p.category === "string" ? resolveCategory(p.category) : null;
+  if (!resolvedCategory) {
+    return JSON.stringify({
+      status: "error",
+      message: `Invalid category "${String(p.category)}". Use one of: identity, relationship, active_thread, episodic, error.`,
+    }, null, 2);
+  }
+
+  let resolvedSalience: { salience: MemorySalience; coerced: boolean } | null = null;
+  if (p.salience !== undefined) {
+    resolvedSalience = typeof p.salience === "string" ? resolveSalience(p.salience) : null;
+    if (!resolvedSalience) {
+      return JSON.stringify({
+        status: "error",
+        message: `Invalid salience "${String(p.salience)}". Use one of: high, medium, low.`,
+      }, null, 2);
+    }
+  }
+
+  const warnings: string[] = [];
+  if (resolvedCategory.coerced) warnings.push(`category "${p.category}" is deprecated — coerced to "${resolvedCategory.category}"`);
+  if (resolvedSalience?.coerced) warnings.push(`salience "${p.salience}" is deprecated — coerced to "${resolvedSalience.salience}"`);
+
   const now = new Date().toISOString();
   let memory: Memory;
 
@@ -473,11 +635,11 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     }
     memory = {
       ...existing,
-      category: p.category,
+      category: resolvedCategory.category,
       content: p.content,
       gist: p.gist !== undefined ? p.gist.trim() : existing.gist,
       gist_autogenerated: p.gist !== undefined ? false : existing.gist_autogenerated,
-      salience: p.salience ?? existing.salience,
+      salience: resolvedSalience?.salience ?? existing.salience,
       core: p.core ?? existing.core,
       epistemic_status: p.epistemic_status ?? existing.epistemic_status,
       provenance: p.provenance !== undefined ? p.provenance : existing.provenance,
@@ -502,11 +664,11 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     }
     memory = {
       id: crypto.randomUUID(),
-      category: p.category,
+      category: resolvedCategory.category,
       content: p.content,
       gist: p.gist.trim(),
       gist_autogenerated: false,
-      salience: p.salience ?? "medium",
+      salience: resolvedSalience?.salience ?? "medium",
       core: p.core ?? false,
       last_retrieved: null,
       retrieval_count: 0,
@@ -536,6 +698,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     memory_id: memory.id,
     category: memory.category,
     core: memory.core,
+    ...(warnings.length > 0 ? { warnings } : {}),
   }, null, 2);
 }
 
@@ -667,11 +830,26 @@ async function handleForget(params: unknown, env: Env): Promise<string> {
   }, null, 2);
 }
 
-// Migration is idempotent: a record counts as "needs migration" only if it
-// is missing the v0.2 marker fields (gist, retrieval_count). Re-running
-// after a full migration is a no-op — no backup, no writes.
+// Migration is idempotent: a record counts as "needs migration" if it's
+// missing the v0.2 marker fields (gist, retrieval_count) OR its category/
+// salience has drifted from the canonical enum (v0.3). Re-running after a
+// full migration is a no-op — no backup, no writes.
 function needsMigration(m: Memory): boolean {
-  return m.gist === undefined || m.retrieval_count === undefined;
+  return (
+    m.gist === undefined ||
+    m.retrieval_count === undefined ||
+    !CANONICAL_CATEGORIES.has(m.category) ||
+    !isCanonicalSalience(m.salience)
+  );
+}
+
+function countByCategory(memories: Array<{ category: unknown }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const m of memories) {
+    const key = typeof m.category === "string" ? m.category : String(m.category);
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
 }
 
 async function handleMigrate(_params: unknown, env: Env): Promise<string> {
@@ -685,27 +863,36 @@ async function handleMigrate(_params: unknown, env: Env): Promise<string> {
     )
   ).filter((m): m is Memory => m !== null);
 
+  const beforeCounts = countByCategory(rawMemories);
   const toMigrate = rawMemories.filter(needsMigration);
+  const alreadyCompliant = rawMemories.filter(m => !needsMigration(m));
 
   if (toMigrate.length === 0) {
+    console.log("taproot_migrate: no-op, category counts", beforeCounts);
     return JSON.stringify({
       status: "ok",
       message: "Already migrated — no records needed backfill.",
       migrated: 0,
       already_migrated: rawMemories.length,
       total: rawMemories.length,
+      category_counts_before: beforeCounts,
+      category_counts_after: beforeCounts,
     }, null, 2);
   }
 
   // Back up the full pre-migration state before touching anything. Content
-  // is never rewritten by this migration — only new fields are added.
+  // is never rewritten by this migration — only new fields are added and
+  // category/salience are normalized onto the canonical enum.
   const backupKey = `backup:schema-v2-${new Date().toISOString()}`;
   await env.TAPROOT_KV.put(backupKey, JSON.stringify(rawMemories, null, 2));
 
+  const migratedRecords: Memory[] = [];
   for (const m of toMigrate) {
     const gistAuto = m.gist === undefined;
     const migrated: Memory = {
       ...m,
+      category: migrateCategory(m.category),
+      salience: migrateSalience(m.salience),
       gist: m.gist ?? autoGist(m.content),
       gist_autogenerated: m.gist_autogenerated ?? gistAuto,
       core: m.core ?? false,
@@ -717,14 +904,20 @@ async function handleMigrate(_params: unknown, env: Env): Promise<string> {
       provenance: m.provenance ?? null,
     };
     await putMemory(env.TAPROOT_KV, migrated);
+    migratedRecords.push(migrated);
   }
+
+  const afterCounts = countByCategory([...alreadyCompliant, ...migratedRecords]);
+  console.log("taproot_migrate: category counts before", beforeCounts, "after", afterCounts);
 
   return JSON.stringify({
     status: "ok",
     migrated: toMigrate.length,
-    already_migrated: rawMemories.length - toMigrate.length,
+    already_migrated: alreadyCompliant.length,
     total: rawMemories.length,
     backup_key: backupKey,
+    category_counts_before: beforeCounts,
+    category_counts_after: afterCounts,
   }, null, 2);
 }
 
@@ -755,9 +948,12 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
   const catalogCount = allKeys.length - coreCount;
 
   const reflectPayload = await buildReflectPayload(env);
+  const reflectPayloadLength = JSON.stringify(reflectPayload).length;
   // Rough token estimate — no tokenizer available in-Worker; ~4 chars/token
   // is a standard heuristic for English text and good enough to watch a budget.
-  const approxReflectTokens = Math.ceil(JSON.stringify(reflectPayload).length / 4);
+  const approxReflectTokens = Math.ceil(reflectPayloadLength / 4);
+  const approxReflectKb = Math.round((reflectPayloadLength / 1024) * 10) / 10;
+  const catalogLinesOmitted = Object.values(reflectPayload.catalog_omitted).reduce((a, b) => a + b, 0);
 
   return JSON.stringify({
     status: "operational",
@@ -769,7 +965,11 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     tiers: {
       core_count: coreCount,
       catalog_count: catalogCount,
+      catalog_lines_included: reflectPayload.catalog_count,
+      catalog_lines_omitted: catalogLinesOmitted,
+      catalog_window_days: REFLECT_CONFIG.CATALOG_WINDOW_DAYS,
       approx_reflect_payload_tokens: approxReflectTokens,
+      approx_reflect_payload_kb: approxReflectKb,
     },
   }, null, 2);
 }
