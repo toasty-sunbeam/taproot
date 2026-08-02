@@ -1085,6 +1085,11 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Internal error";
+        // Temporary diagnostic logging (v0.3 taproot_status investigation) —
+        // wrangler tail's default view only shows invocation outcome, not
+        // the caught error, so log it explicitly to see what's actually
+        // failing. Safe to remove once the root cause is confirmed.
+        console.error(`[taproot] ${p.name} threw:`, e instanceof Error ? (e.stack ?? e.message) : e);
         return jsonErr(id, -32603, msg);
       }
 
