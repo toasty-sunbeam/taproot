@@ -497,11 +497,19 @@ interface ReflectPayload {
   recent_closings: Array<{ id: string; conversation_title?: string; reflection: string; created_at: string }>;
 }
 
-async function buildReflectPayload(env: Env): Promise<ReflectPayload> {
-  const [allKeys, closingKeys] = await Promise.all([
-    listMemoryKeys(env.TAPROOT_KV),
-    listClosingKeys(env.TAPROOT_KV),
-  ]);
+// Accepts already-fetched key listings so callers that need both their own
+// key-level view (e.g. taproot_status's per-category counts) and the reflect
+// payload don't pay for listMemoryKeys/listClosingKeys twice in one request.
+async function buildReflectPayload(
+  env: Env,
+  prefetched?: {
+    allKeys: Array<{ name: string; metadata?: MemoryMeta }>;
+    closingKeys: Array<{ name: string; metadata?: { created_at: string } }>;
+  },
+): Promise<ReflectPayload> {
+  const [allKeys, closingKeys] = prefetched
+    ? [prefetched.allKeys, prefetched.closingKeys]
+    : await Promise.all([listMemoryKeys(env.TAPROOT_KV), listClosingKeys(env.TAPROOT_KV)]);
 
   const liveKeys = allKeys.filter(k => !k.metadata?.tags?.includes("_archive_pending"));
   const coreKeys = liveKeys.filter(k => k.metadata?.core === true);
@@ -558,7 +566,12 @@ async function buildReflectPayload(env: Env): Promise<ReflectPayload> {
     )
   ).filter((c): c is Closing => c !== null);
 
-  const catalogCount = CATEGORY_ORDER.reduce((sum, cat) => sum + (catalogByCategory[cat]?.length ?? 0), 0);
+  // Sum every bucket actually present in catalogByCategory, not just the
+  // canonical five — a category can transiently appear outside the
+  // canonical set (e.g. KV list() metadata hasn't yet caught up with a
+  // taproot_migrate write), and catalog_count must reflect what's actually
+  // in the payload rather than silently dropping those lines from the total.
+  const catalogCount = Object.values(catalogByCategory).reduce((sum, lines) => sum + lines.length, 0);
 
   return {
     status: "ok",
@@ -947,7 +960,7 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
   }
   const catalogCount = allKeys.length - coreCount;
 
-  const reflectPayload = await buildReflectPayload(env);
+  const reflectPayload = await buildReflectPayload(env, { allKeys, closingKeys });
   const reflectPayloadLength = JSON.stringify(reflectPayload).length;
   // Rough token estimate — no tokenizer available in-Worker; ~4 chars/token
   // is a standard heuristic for English text and good enough to watch a budget.
