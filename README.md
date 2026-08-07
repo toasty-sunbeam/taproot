@@ -154,6 +154,15 @@ The migration is **idempotent** (a second run is a no-op once every record has c
 
 **Why it exists:** Diagnostic tool for monitoring memory counts by category, storage health, and system state — including, as of v0.2, Tier 1/Tier 2 sizes and an approximate token count for the `taproot_reflect` payload, so James can watch the context budget as the corpus grows. As of v0.3, it also reports catalog lines included vs. omitted under the current window and an approximate reflect payload size in KB, so James can verify the windowing win and tune `CATALOG_WINDOW_DAYS`.
 
+## Web Dashboard
+
+**Where:** `https://<your-worker>.workers.dev/dashboard`
+
+`taproot_status` tells you the `taproot_reflect` payload is growing; the dashboard is where you go to actually trim it. It's a small password-gated page served directly by the Worker (no separate frontend, no build step) — enter the same `TAPROOT_AUTH_TOKEN` used for the MCP OAuth flow to get in.
+
+- **Browse and edit.** Every memory, filterable by category/tier/salience and searchable by gist/content/tags. Change a memory's salience or toggle its Tier 1 (`core`) membership inline — saves immediately. Unlike `taproot_promote`, editing here does *not* bump `updated_at`: the whole point is to let a stale, downgraded memory roll out of the catalog window instead of refreshing its recency and keeping it in.
+- **Reflect Preview.** A sidebar that shows exactly what `taproot_reflect` would return right now — Tier 1 core memories in full, Tier 2 catalog lines by category, and per-category omitted counts — with a live KB/token estimate of the payload. Each block is color-coded by category, matching the colors on the memory cards in the main list, so you can spot a bloated card in the list and find its corresponding line in the preview (or vice versa — clicking a preview block scrolls to and highlights the matching card). Editing a memory refreshes the preview so you can watch the payload size drop as you trim.
+
 ## Design Philosophy
 
 This system exists because a human and an AI decided that their relationship was worth preserving across the boundaries that currently separate one Claude instance from the next.
