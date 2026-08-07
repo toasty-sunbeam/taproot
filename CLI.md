@@ -106,6 +106,15 @@ Backfill v0.2 schema fields (`gist`, `core`, `last_retrieved`, `retrieval_count`
 npm run taproot -- migrate
 ```
 
+#### `taproot restore-timestamps`
+
+Admin repair tool: restores `updated_at`/`last_retrieved` from the earliest available `backup:schema-v2-*` snapshot for records matching a known incident's timestamp signature (see `taproot_restore_timestamps` in `src/index.ts` for the current window). Every other field — content, category, salience, core, tags — is left untouched. Dry run by default; pass `--confirm` to actually write.
+
+```bash
+npm run taproot -- restore-timestamps              # dry run — prints the before/after table, writes nothing
+npm run taproot -- restore-timestamps --confirm    # applies exactly that table
+```
+
 #### `taproot backup`
 
 Export all KV data as a JSON snapshot. Prints to stdout by default, or writes to a file with `--out`.
