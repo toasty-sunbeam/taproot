@@ -17,6 +17,7 @@
  *   taproot forget       <memory-id> --action <archive|delete> [--reason <r>]
  *   taproot promote      <memory-id> [--core <true|false>] [--salience <s>]
  *   taproot migrate
+ *   taproot restore-timestamps [--confirm]   dry run by default; --confirm applies it
  *   taproot backup       [--out <file>]
  */
 
@@ -320,6 +321,11 @@ async function cmdMigrate(): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_migrate"));
 }
 
+async function cmdRestoreTimestamps(args: string[]): Promise<void> {
+  const confirm = boolFlag(args, "confirm") ?? false;
+  console.log(await callTool(loadConfig(), "taproot_restore_timestamps", { confirm }));
+}
+
 async function cmdBackup(args: string[]): Promise<void> {
   const config = loadConfig();
   const base = config.serverUrl.replace(/\/$/, "");
@@ -371,6 +377,7 @@ const [, , cmd, ...rest] = process.argv;
     case "forget":    return cmdForget(rest);
     case "promote":   return cmdPromote(rest);
     case "migrate":   return cmdMigrate();
+    case "restore-timestamps": return cmdRestoreTimestamps(rest);
     case "backup":    return cmdBackup(rest);
     default:
       console.error(USAGE);
