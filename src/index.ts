@@ -129,7 +129,7 @@ const TOOLS = [
   {
     name: "taproot_recall",
     description:
-      "Retrieve full-text memories ranked by activation (recency, frequency, salience, and relevance to your query). Use this to pull full text for anything that looked relevant in the taproot_reflect catalog. Every memory returned is 'strengthened' — its retrieval count and last-touched date update, making it more likely to surface again.",
+      "Retrieve full-text memories ranked by activation (recency, frequency, salience, and relevance to your query). Use this to pull full text for anything that looked relevant in the taproot_reflect catalog. Every memory returned is 'strengthened' by default — its retrieval count and last-touched date update, making it more likely to surface again. Pass strengthen:false for administrative or bulk reads that shouldn't count as attention (e.g. verification sweeps, diagnostics) — otherwise those reads inflate last_retrieved and hold memories artificially 'fresh' in the taproot_reflect catalog window.",
     inputSchema: {
       type: "object",
       properties: {
@@ -154,6 +154,10 @@ const TOOLS = [
           description: "ISO timestamp — return memories created/updated after this date",
         },
         limit: { type: "number", description: "Maximum results (default: 5)" },
+        strengthen: {
+          type: "boolean",
+          description: "Whether this read counts as attention — updates last_retrieved and retrieval_count. Default true. Pass false for administrative/bulk/diagnostic reads.",
+        },
       },
       required: [],
     },
@@ -201,6 +205,21 @@ const TOOLS = [
     description:
       "Admin: backfill v0.2 schema fields (gist, core, last_retrieved, retrieval_count, epistemic_status, replication_count, provenance) and normalize v0.3 category/salience drift onto every existing memory record. Idempotent — safe to run more than once. Writes a full backup of all memory records to KV before mutating anything, and never touches memory content.",
     inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "taproot_restore_timestamps",
+    description:
+      "Admin: one-time repair for the 2026-08-03 incident where updated_at got stamped to \"now\" on ~13 records during a write batch, and last_retrieved got inflated by administrative taproot_recall sweeps on Aug 2-3 and Aug 7 — both artificially held records inside taproot_reflect's catalog window. Restores ONLY updated_at and last_retrieved (plus decrementing retrieval_count by 1 where last_retrieved is restored) from the earliest available backup:schema-v2-* snapshot, matched by the incident's known timestamp signature. Every other field (content, category, salience, core, tags) is left as its current value. Dry-run by default — returns a before/after table without writing. Pass confirm:true to apply exactly that table. Idempotent: already-restored records fall outside the timestamp windows on a second run, so nothing double-applies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirm: {
+          type: "boolean",
+          description: "Set true to write the restored values. Default false (dry run — table only, no writes).",
+        },
+      },
+      required: [],
+    },
   },
   {
     name: "taproot_status",
@@ -770,6 +789,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
     tags?: string[];
     since?: string;
     limit?: number;
+    strengthen?: boolean;
   };
 
   const limit = p.limit ?? 5;
@@ -809,17 +829,25 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
-  // Retrieval strengthens: every hit updates last_retrieved / retrieval_count.
-  const nowIso = new Date(now).toISOString();
-  await Promise.all(ranked.map(({ memory }) => {
-    memory.last_retrieved = nowIso;
-    memory.retrieval_count += 1;
-    return putMemory(env.TAPROOT_KV, memory);
-  }));
+  // Retrieval strengthens by default: every hit updates last_retrieved /
+  // retrieval_count. strengthen:false skips this — for administrative/bulk/
+  // diagnostic reads that shouldn't count as attention (they'd otherwise
+  // inflate last_retrieved and hold memories artificially "fresh" in the
+  // taproot_reflect catalog window).
+  const strengthen = p.strengthen ?? true;
+  if (strengthen) {
+    const nowIso = new Date(now).toISOString();
+    await Promise.all(ranked.map(({ memory }) => {
+      memory.last_retrieved = nowIso;
+      memory.retrieval_count += 1;
+      return putMemory(env.TAPROOT_KV, memory);
+    }));
+  }
 
   return JSON.stringify({
     status: "ok",
     count: ranked.length,
+    strengthened: strengthen,
     results: ranked.map(({ memory, score }) => ({
       ...memory,
       activation_score: Math.round(score * 1000) / 1000,
@@ -955,6 +983,149 @@ async function handleMigrate(_params: unknown, env: Env): Promise<string> {
   }, null, 2);
 }
 
+// ─── One-time repair: Aug 3 timestamp incident ──────────────────────────────
+// Two write batches inflated freshness and held ~40 catalog lines open in
+// taproot_reflect's window that should have aged out:
+//   1. A batch of per-record writes around 2026-08-03T13:29 UTC stamped
+//      updated_at to "now" on ~13 records (handleMigrate's own write path
+//      was read and confirmed clean — it never assigns updated_at — so this
+//      was some other write path; see taproot_restore_timestamps's tool
+//      description for the caveat about taproot_promote's unconditional
+//      stamp, a plausible contributor).
+//   2. taproot_recall's retrieval-strengthening ran during Aug 2-3
+//      verification sweeps (including a limit:60 sweep against
+//      active_thread) and again on 2026-08-07T21:57:21.447Z during this
+//      incident's own diagnosis, stamping last_retrieved on reads that
+//      shouldn't have counted as attention. taproot_recall's new
+//      strengthen:false param exists so this doesn't recur.
+// These windows are the observed timestamp signature of the incident, not a
+// general-purpose tool — they're deliberately narrow and dated.
+const TIMESTAMP_RESTORE_WINDOWS = {
+  UPDATED_AT_CLOBBER_START: "2026-08-03T13:20:00.000Z",
+  UPDATED_AT_CLOBBER_END: "2026-08-03T13:40:00.000Z",
+  LAST_RETRIEVED_SWEEP_DATES: ["2026-08-02", "2026-08-03"] as readonly string[],
+  LAST_RETRIEVED_SWEEP_EXACT: ["2026-08-07T21:57:21.447Z"] as readonly string[],
+};
+
+function inUpdatedAtClobberWindow(ts: string): boolean {
+  return ts >= TIMESTAMP_RESTORE_WINDOWS.UPDATED_AT_CLOBBER_START && ts <= TIMESTAMP_RESTORE_WINDOWS.UPDATED_AT_CLOBBER_END;
+}
+
+function inLastRetrievedSweepWindow(ts: string | null): boolean {
+  if (!ts) return false;
+  if (TIMESTAMP_RESTORE_WINDOWS.LAST_RETRIEVED_SWEEP_EXACT.includes(ts)) return true;
+  return TIMESTAMP_RESTORE_WINDOWS.LAST_RETRIEVED_SWEEP_DATES.includes(ts.slice(0, 10));
+}
+
+async function listBackupSnapshots(kv: KVNamespace): Promise<Array<{ key: string; timestamp: string; records: Memory[] }>> {
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const result = await kv.list({ prefix: "backup:schema-v2-", ...(cursor ? { cursor } : {}) });
+    for (const k of result.keys) keys.push(k.name);
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  const snapshots = await Promise.all(keys.map(async name => {
+    const raw = await kv.get(name);
+    let records: Memory[] = [];
+    try {
+      records = raw ? (JSON.parse(raw) as Memory[]) : [];
+    } catch {
+      records = [];
+    }
+    return { key: name, timestamp: name.slice("backup:schema-v2-".length), records };
+  }));
+  // Ascending — earliest snapshot first, so the first hit for a given id in
+  // listBackupSnapshots' consumer is the value closest to true original.
+  return snapshots.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+interface TimestampRestoreRow {
+  id: string;
+  gist: string;
+  category: string;
+  updated_at: { old: string; new: string; matched: boolean };
+  last_retrieved: { old: string | null; new: string | null; matched: boolean };
+  retrieval_count: { old: number; new: number };
+  snapshot_found: boolean;
+}
+
+async function handleRestoreTimestamps(params: unknown, env: Env): Promise<string> {
+  const p = params as { confirm?: boolean };
+  const confirm = p.confirm === true;
+
+  const [allKeys, snapshots] = await Promise.all([
+    listMemoryKeys(env.TAPROOT_KV),
+    listBackupSnapshots(env.TAPROOT_KV),
+  ]);
+
+  // Earliest snapshot containing each id -- backups are taken before every
+  // migration run, so the earliest one holding a given id is the closest
+  // available value to what it was before this incident touched it.
+  const earliestById = new Map<string, Memory>();
+  for (const snap of snapshots) {
+    for (const record of snap.records) {
+      if (!earliestById.has(record.id)) earliestById.set(record.id, record);
+    }
+  }
+
+  const currentRecords = (
+    await Promise.all(allKeys.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
+  ).filter((m): m is Memory => m !== null);
+
+  const rows: TimestampRestoreRow[] = [];
+  for (const current of currentRecords) {
+    const updatedAtMatched = inUpdatedAtClobberWindow(current.updated_at);
+    const lastRetrievedMatched = inLastRetrievedSweepWindow(current.last_retrieved);
+    if (!updatedAtMatched && !lastRetrievedMatched) continue;
+
+    const snapshot = earliestById.get(current.id);
+    const snapshotFound = snapshot !== undefined;
+
+    const newUpdatedAt = updatedAtMatched && snapshot ? snapshot.updated_at : current.updated_at;
+    const newLastRetrieved = lastRetrievedMatched && snapshot ? (snapshot.last_retrieved ?? null) : current.last_retrieved;
+    const newRetrievalCount = lastRetrievedMatched && snapshot ? Math.max(0, current.retrieval_count - 1) : current.retrieval_count;
+
+    rows.push({
+      id: current.id,
+      gist: current.gist.slice(0, 60),
+      category: current.category,
+      updated_at: { old: current.updated_at, new: newUpdatedAt, matched: updatedAtMatched },
+      last_retrieved: { old: current.last_retrieved, new: newLastRetrieved, matched: lastRetrievedMatched },
+      retrieval_count: { old: current.retrieval_count, new: newRetrievalCount },
+      snapshot_found: snapshotFound,
+    });
+
+    // Hard rule: only updated_at/last_retrieved (and the retrieval_count
+    // that rides along with last_retrieved) come from the snapshot. Every
+    // other field — content, category, salience, core, tags — is `current`,
+    // untouched, since those have legitimately changed since the snapshot
+    // was taken (dedupe, salience audit, category migration).
+    if (confirm && snapshot) {
+      const restored: Memory = {
+        ...current,
+        updated_at: newUpdatedAt,
+        last_retrieved: newLastRetrieved,
+        retrieval_count: newRetrievalCount,
+      };
+      await putMemory(env.TAPROOT_KV, restored);
+    }
+  }
+
+  return JSON.stringify({
+    status: "ok",
+    mode: confirm ? "applied" : "dry_run",
+    candidates: rows.length,
+    restored: confirm ? rows.filter(r => r.snapshot_found).length : 0,
+    missing_snapshot: rows.filter(r => !r.snapshot_found).map(r => r.id),
+    note: confirm
+      ? "Restored updated_at/last_retrieved from the earliest available backup:schema-v2-* snapshot for each matched record. All other fields left untouched."
+      : "Dry run — nothing written. Review the table, then call again with confirm:true to apply exactly this.",
+    table: rows,
+  }, null, 2);
+}
+
 async function handleStatus(_params: unknown, env: Env): Promise<string> {
   const [allKeys, closingKeys] = await Promise.all([
     listMemoryKeys(env.TAPROOT_KV),
@@ -979,7 +1150,6 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     }
     if (k.metadata?.core === true) coreCount++;
   }
-  const catalogCount = allKeys.length - coreCount;
 
   const reflectPayload = await buildReflectPayload(env, { allKeys, closingKeys });
   const reflectPayloadLength = JSON.stringify(reflectPayload).length;
@@ -988,6 +1158,13 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
   const approxReflectTokens = Math.ceil(reflectPayloadLength / 4);
   const approxReflectKb = Math.round((reflectPayloadLength / 1024) * 10) / 10;
   const catalogLinesOmitted = Object.values(reflectPayload.catalog_omitted).reduce((a, b) => a + b, 0);
+  // Derived from the same live-only reflectPayload as catalog_lines_included/
+  // omitted, so catalog_count == included + omitted holds by construction —
+  // not from allKeys.length - coreCount, which (being unfiltered) also
+  // counts archived records that reflect's liveKeys filter excludes from
+  // both included and omitted, and previously made the two silently diverge
+  // by exactly compression_queue.
+  const catalogCount = reflectPayload.catalog_count + catalogLinesOmitted;
 
   return JSON.stringify({
     status: "operational",
@@ -1099,6 +1276,7 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
           case "taproot_forget":    result = await handleForget(args, env); break;
           case "taproot_promote":   result = await handlePromote(args, env); break;
           case "taproot_migrate":   result = await handleMigrate(args, env); break;
+          case "taproot_restore_timestamps": result = await handleRestoreTimestamps(args, env); break;
           case "taproot_status":    result = await handleStatus(args, env); break;
           case "taproot_close":     result = await handleClose(args, env); break;
           default:
