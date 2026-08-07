@@ -98,6 +98,8 @@ Curate Tier 1: toggle a memory's `core` flag and/or adjust its salience.
 npm run taproot -- promote <memory-id> [--core <true|false>] [--salience <s>]
 ```
 
+For curating many memories at once — e.g. trimming the `taproot_reflect` payload — the web dashboard at `/dashboard` does the same `core`/`salience` edits with a browsable, filterable UI and a live preview of the resulting reflect payload. See the "Web Dashboard" section in `README.md`.
+
 #### `taproot migrate`
 
 Backfill v0.2 schema fields (`gist`, `core`, `last_retrieved`, `retrieval_count`, `epistemic_status`, `replication_count`, `provenance`) onto every existing memory record. Idempotent — safe to run more than once. Writes a full backup of all memory records to a `backup:` KV key before mutating anything; never rewrites `content`.
