@@ -6,10 +6,12 @@
 // just wants a password prompt. This module owns its own lightweight
 // cookie session (backed by TAPROOT_KV) rather than reusing the OAuth flow.
 
-import type { Memory, MemorySalience } from "./types.js";
+import type { Closing, Memory, MemorySalience } from "./types.js";
 import type { Env } from "./storage.js";
 import {
   listMemoryKeys,
+  listClosingKeys,
+  getClosing,
   idFromKey,
   getMemory,
   putMemory,
@@ -191,6 +193,25 @@ async function handleListMemories(env: Env): Promise<Response> {
   });
 }
 
+async function handleListClosings(env: Env): Promise<Response> {
+  const keys = await listClosingKeys(env.TAPROOT_KV);
+  const closings = (
+    await Promise.all(keys.map(k => getClosing(env.TAPROOT_KV, k.name.slice("close:".length))))
+  ).filter((c): c is Closing => c !== null);
+
+  return json({
+    closings: closings
+      .map(c => ({
+        id: c.id,
+        conversation_title: c.conversation_title ?? null,
+        conversation_url: c.conversation_url ?? null,
+        reflection: c.reflection,
+        created_at: c.created_at,
+      }))
+      .sort((a, b) => b.created_at.localeCompare(a.created_at)),
+  });
+}
+
 async function handleUpdateMemory(id: string, request: Request, env: Env): Promise<Response> {
   let body: { salience?: unknown; core?: unknown };
   try {
@@ -322,6 +343,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .content { display: none; margin-top: 10px; font-size: 13px; line-height: 1.55; color: var(--text-dim); white-space: pre-wrap; border-top: 1px solid var(--border); padding-top: 10px; }
   .content.open { display: block; }
 
+  #closings { flex: 1; padding: 16px 20px 60px; display: none; flex-direction: column; gap: 10px; min-width: 0; }
+  .closing-card { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 12px 14px; }
+  .closing-title { font-weight: 600; font-size: 13.5px; }
+  .closing-meta { font-size: 12px; color: var(--text-faint); margin-top: 2px; }
+  .closing-meta a { color: var(--text-dim); }
+  .closing-text { margin-top: 10px; font-size: 13px; line-height: 1.55; color: var(--text-dim); white-space: pre-wrap; border-top: 1px solid var(--border); padding-top: 10px; }
+  body.view-closings #list, body.view-closings .legend, body.view-closings .toolbar { display: none; }
+  body.view-closings #closings { display: flex; }
+  header button.active { border-color: var(--accent); color: #c7d2fe; }
+
   #sidebar { width: 0; overflow: hidden; border-left: 1px solid var(--border); background: var(--panel); transition: width .2s; }
   body.sidebar-open #sidebar { width: 420px; flex-shrink: 0; }
   #sidebar-inner { width: 420px; padding: 16px 18px 60px; }
@@ -350,6 +381,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <header>
     <h1>Taproot Memories</h1>
     <div class="stats" id="stats"></div>
+    <button id="view-memories" class="active">Memories</button>
+    <button id="view-closings">Closings</button>
     <div class="spacer"></div>
     <button class="primary" id="toggle-sidebar">Reflect Preview</button>
     <form class="logout" method="POST" action="/dashboard/logout"><button type="submit">Log out</button></form>
@@ -385,6 +418,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <main>
     <div id="list"></div>
+    <div id="closings"></div>
     <div id="sidebar"><div id="sidebar-inner"></div></div>
   </main>
 
@@ -399,6 +433,7 @@ const CATEGORY_COLORS = {
 const TIER_LABELS = { core: "Core", catalog: "Catalog", omitted: "Omitted", archived: "Archived" };
 
 let memories = [];
+let closings = null;
 let reflectData = null;
 let sidebarOpen = false;
 const filters = { search: "", categories: new Set(), tier: "all", salience: "all" };
@@ -627,6 +662,35 @@ function renderSidebar() {
   ));
 }
 
+function renderClosings() {
+  const wrap = document.getElementById("closings");
+  wrap.innerHTML = "";
+  if (!closings) { wrap.appendChild(el("div", { class: "sb-empty", text: "Loading…" })); return; }
+  if (closings.length === 0) { wrap.appendChild(el("div", { class: "sb-empty", text: "No closing statements yet." })); return; }
+  for (const c of closings) {
+    const meta = el("div", { class: "closing-meta" }, fmtDate(c.created_at));
+    if (c.conversation_url) meta.appendChild(el("span", {}, " · ", el("a", { href: c.conversation_url, target: "_blank", rel: "noopener noreferrer", text: "conversation" })));
+    wrap.appendChild(el("div", { class: "closing-card" },
+      el("div", { class: "closing-title", text: c.conversation_title || "Untitled conversation" }),
+      meta,
+      el("div", { class: "closing-text", text: c.reflection }),
+    ));
+  }
+}
+
+async function loadClosings() {
+  closings = (await api("/dashboard/api/closings")).closings;
+  renderClosings();
+}
+
+function setView(view) {
+  const showClosings = view === "closings";
+  document.body.classList.toggle("view-closings", showClosings);
+  document.getElementById("view-memories").classList.toggle("active", !showClosings);
+  document.getElementById("view-closings").classList.toggle("active", showClosings);
+  if (showClosings && !closings) { renderClosings(); loadClosings().catch(e => toast("Failed to load: " + e.message)); }
+}
+
 async function loadMemories() {
   const data = await api("/dashboard/api/memories");
   memories = data.memories;
@@ -645,6 +709,8 @@ document.getElementById("toggle-sidebar").addEventListener("click", () => {
   document.body.classList.toggle("sidebar-open", sidebarOpen);
   if (sidebarOpen && !reflectData) loadReflect();
 });
+document.getElementById("view-memories").addEventListener("click", () => setView("memories"));
+document.getElementById("view-closings").addEventListener("click", () => setView("closings"));
 document.getElementById("search").addEventListener("input", (e) => { filters.search = e.target.value; renderList(); });
 document.getElementById("tier-filter").addEventListener("change", (e) => { filters.tier = e.target.value; renderList(); });
 document.getElementById("salience-filter").addEventListener("change", (e) => { filters.salience = e.target.value; renderList(); });
@@ -674,6 +740,9 @@ export async function handleDashboardRequest(request: Request, env: Env): Promis
   }
   if (url.pathname === "/dashboard/api/memories" && request.method === "GET") {
     return requireAuth(request, env, () => handleListMemories(env));
+  }
+  if (url.pathname === "/dashboard/api/closings" && request.method === "GET") {
+    return requireAuth(request, env, () => handleListClosings(env));
   }
   if (url.pathname.startsWith("/dashboard/api/memories/") && request.method === "PATCH") {
     const id = url.pathname.slice("/dashboard/api/memories/".length);
