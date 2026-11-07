@@ -10,6 +10,8 @@
  *   taproot reflect
  *   taproot recall       [--query <q>] [--category <c>] [--ids id1,id2] [--tags t1,t2]
  *                        [--since <iso>] [--limit <n>]
+ *   taproot list         [--category <c>] [--include-archived] [--limit <n>] [--cursor <c>] [--all]
+ *   taproot audit        [--file <backup.json>]   offline when --file is given
  *   taproot remember     <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]
  *                        [--core] [--epistemic-status <s>] [--provenance <p>]
  *                        [--conversation-url <url>] [--search-keywords k1,k2]
@@ -252,7 +254,9 @@ async function cmdRemember(args: string[]): Promise<void> {
     const positional = firstFlagIdx === -1 ? args : args.slice(0, firstFlagIdx);
     content = positional.join(" ");
   }
-  if (!content.trim()) {
+  const updateIdEarly = flag(args, "update-id");
+  // On update, content is optional: omit it to keep the stored text.
+  if (!content.trim() && !updateIdEarly) {
     die(
       "Usage: taproot remember <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]\n" +
         "                        [--core] [--epistemic-status <s>] [--provenance <p>]\n" +
@@ -260,10 +264,13 @@ async function cmdRemember(args: string[]): Promise<void> {
         "                        [--update-id <id>] [--conversation-id <id>]",
     );
   }
-  const params: Record<string, unknown> = {
-    content,
-    category: flag(args, "category") ?? "episodic",
-  };
+  // On update, only send what was given. Defaulting category to "episodic"
+  // here used to silently re-categorize a memory on every CLI update.
+  const params: Record<string, unknown> = {};
+  if (content.trim()) params.content = content;
+  const categoryFlag = flag(args, "category");
+  if (categoryFlag) params.category = categoryFlag;
+  else if (!updateIdEarly) params.category = "episodic";
   const gist = flag(args, "gist");
   const salience = flag(args, "salience");
   const core = boolFlag(args, "core");
@@ -326,6 +333,54 @@ async function cmdRestoreTimestamps(args: string[]): Promise<void> {
   console.log(await callTool(loadConfig(), "taproot_restore_timestamps", { confirm }));
 }
 
+async function cmdList(args: string[]): Promise<void> {
+  const params: Record<string, unknown> = {};
+  const category = flag(args, "category");
+  const limit = flag(args, "limit");
+  const cursor = flag(args, "cursor");
+  if (category) params.category = category;
+  if (boolFlag(args, "include-archived")) params.include_archived = true;
+  if (limit) params.limit = Number(limit);
+  if (cursor) params.cursor = cursor;
+  if (!boolFlag(args, "all")) {
+    console.log(await callTool(loadConfig(), "taproot_list", params));
+    return;
+  }
+  // --all: follow next_cursor and print one merged result.
+  const config = loadConfig();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const items: any[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let page: any;
+  do {
+    page = JSON.parse(await callTool(config, "taproot_list", params));
+    if (page.status !== "ok") die(JSON.stringify(page));
+    items.push(...page.items);
+    params.cursor = page.next_cursor;
+  } while (page.next_cursor);
+  console.log(JSON.stringify({ ...page, count: items.length, has_more: false, next_cursor: null, items }, null, 2));
+}
+
+async function cmdAudit(args: string[]): Promise<void> {
+  const file = flag(args, "file");
+  if (!file) {
+    console.log(await callTool(loadConfig(), "taproot_audit"));
+    return;
+  }
+  // Offline: audit a `taproot backup` export, no server needed. Lets you run
+  // the audit before deploying v0.4, against the backup you just took.
+  const { auditContent } = await import("./src/audit.js");
+  const data = JSON.parse(readFileSync(file, "utf8")) as { entries?: Array<{ key: string; value: unknown }> };
+  const entries = data.entries ?? [];
+  const records = entries
+    .filter((e) => e.key.startsWith("mem:"))
+    .map((e) => (e.value && typeof e.value === "object" ? e.value : { id: e.key.slice(4), content: undefined }) as Record<string, unknown>);
+  const snapshots = entries
+    .filter((e) => e.key.startsWith("backup:schema-v2-"))
+    .map((e) => ({ key: e.key, records: e.value }));
+  console.log(JSON.stringify(auditContent(records, snapshots), null, 2));
+}
+
 async function cmdBackup(args: string[]): Promise<void> {
   const config = loadConfig();
   const base = config.serverUrl.replace(/\/$/, "");
@@ -356,6 +411,8 @@ Commands:
   reflect
   recall       [--query <q>] [--category <c>] [--ids id1,id2] [--tags t1,t2]
                [--since <iso>] [--limit <n>]
+  list         [--category <c>] [--include-archived] [--limit <n>] [--cursor <c>] [--all]
+  audit        [--file <backup.json>]
   remember     <content> --gist <gist> [--category <c>] [--salience <s>] [--tags t1,t2]
                [--core] [--epistemic-status <s>] [--provenance <p>]
                [--conversation-url <url>] [--search-keywords k1,k2]
@@ -373,6 +430,8 @@ const [, , cmd, ...rest] = process.argv;
     case "status":    return cmdStatus();
     case "reflect":   return cmdReflect();
     case "recall":    return cmdRecall(rest);
+    case "list":      return cmdList(rest);
+    case "audit":     return cmdAudit(rest);
     case "remember":  return cmdRemember(rest);
     case "forget":    return cmdForget(rest);
     case "promote":   return cmdPromote(rest);

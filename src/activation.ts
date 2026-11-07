@@ -64,7 +64,7 @@ export function relevanceScore(query: string, memory: Memory): number {
     ...memory.tags.flatMap(tokenize),
     ...tokenize(memory.gist ?? ""),
   ]);
-  const contentTokens = new Set(tokenize(memory.content));
+  const contentTokens = new Set(tokenize(memory.content ?? ""));
 
   let keywordHits = 0;
   let contentOnlyHits = 0;

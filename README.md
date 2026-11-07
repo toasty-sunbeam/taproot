@@ -65,6 +65,8 @@ Each memory includes optional `search_keywords` to help future Claude instances 
 
 New memories require a **`gist`** — a ~15-word one-line summary shown in the `taproot_reflect` Tier 2 catalog. This is enforced at write time deliberately: it's cheaper to write a good gist while the memory is fresh than to reconstruct one later. `taproot_remember` also accepts `core` (Tier 1 membership), `epistemic_status`, and `provenance` — see `taproot_promote` and the validation-project fields below.
 
+**Updates are partial merges (v0.4).** With `update_id`, send only the fields you want to change: every omitted field keeps its stored value, so a gist-only, salience-only or category-only update leaves `content` untouched. `category` and `content` are required only when creating. An empty or whitespace-only `content` is rejected, never treated as a wipe. An auto-generated gist is recomputed only when `content` actually changes. (Before v0.4, an update without `content` silently blanked the stored text; `taproot_audit` finds records that bug hit.)
+
 ---
 
 ### `taproot_recall`
@@ -84,6 +86,24 @@ All weights live as named constants in `ACTIVATION_CONFIG` (`src/activation.ts`)
 **Retrieval strengthens.** Every memory `taproot_recall` returns has its `last_retrieved` and `retrieval_count` updated — this is load-bearing, not a side effect. It's how the system learns what matters over time, the same way retrieval practice strengthens a memory in ACT-R.
 
 `taproot_recall` also serves as an index into conversation history. Each memory's `search_keywords` field contains terms that appeared in the original conversation, so when Claude needs to find a past discussion, it can search Taproot first (finding a curated, keyword-rich pointer) and then use Claude.ai's native conversation search with targeted terms. The memories are the table of contents; the conversations are the chapters.
+
+---
+
+### `taproot_list`
+
+**Purpose:** A lightweight inventory: every memory (optionally one category) as summary rows, without content.
+
+**Why it exists:** `taproot_recall` ranks by activation and relevance, so a never-recalled memory can stay invisible to topical sweeps, and it returns full content, so a 50-result sweep can overflow a client's tool-output limit. The Nov 2026 hygiene pass needed ten topic queries plus a `since` sweep to find every active thread. `taproot_list` is the admin tool for that job.
+
+**Parameters:** `category` (optional, all categories if omitted), `include_archived` (default false), `limit` (default 50, max 250), `cursor` (the previous page's `next_cursor`).
+
+**Returns** per memory: `id`, `category`, `gist`, `salience`, `core`, `created_at`, `updated_at`, `last_retrieved`, `retrieval_count`, `archived`, `tags`. Plus `total` (the full count for the filter), `total_by_category`, `has_more` and `next_cursor`. Order is `updated_at` descending, then `id`, and the cursor is a keyset position, so paging is stable and complete. It is read-only and never strengthens. Use `taproot_recall` with `ids` to load full text for anything that needs it.
+
+---
+
+### `taproot_audit`
+
+**Purpose:** Admin, read-only. Finds memories whose `content` is missing, empty, or not a string, and points to the newest `backup:schema-v2-*` snapshot that still has their text. It never repairs anything. The same report can be produced offline from a `taproot backup` export with `taproot audit --file <backup.json>`.
 
 ---
 
@@ -123,6 +143,8 @@ The migration is **idempotent** (a second run is a no-op once every record has c
 **Purpose:** Report on the current state of the memory system.
 
 **Why it exists:** Diagnostic tool for monitoring memory counts by category, storage health, and system state — including, as of v0.2, Tier 1/Tier 2 sizes and an approximate token count for the `taproot_reflect` payload, so James can watch the context budget as the corpus grows. As of v0.3, it also reports catalog lines included vs. omitted under the current window and an approximate reflect payload size in KB, so James can verify the windowing win and tune `CATALOG_WINDOW_DAYS`.
+
+As of v0.4, `memory_counts` and `total_memories` count **live** memories only. Archived (soft-deleted) records are reported separately in `archived_counts` and `total_archived`, and `total_stored` is everything in KV. `tiers.core_count` is live-only too, matching `taproot_reflect`. Before v0.4, archiving a memory never lowered `memory_counts`. `compression_queue` is unchanged: it still counts records tagged `_compress_pending` or archived.
 
 ## Web Dashboard
 

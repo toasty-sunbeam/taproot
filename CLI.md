@@ -52,6 +52,22 @@ npm run taproot -- recall [--query <text>] [--category <c>] [--ids id1,id2] [--t
 | `--since` | ISO 8601 timestamp — return only memories updated after this time |
 | `--limit` | Maximum number of results (default: 5) |
 
+#### `taproot list`
+
+Lightweight inventory via `taproot_list`: summary rows (no content), deterministic order, never strengthens. `--all` follows `next_cursor` and prints one merged result.
+
+```bash
+npm run taproot -- list [--category <c>] [--include-archived] [--limit <n>] [--cursor <c>] [--all]
+```
+
+#### `taproot audit`
+
+Report memories with missing or empty `content` (read-only). With `--file`, audits a `taproot backup` export offline, with no server call.
+
+```bash
+npm run taproot -- audit [--file <backup.json>]
+```
+
 #### `taproot remember`
 
 Write a new memory or update an existing one. A `--gist` is required when creating a memory — it's what shows up in the Tier 2 catalog.
@@ -74,7 +90,7 @@ npm run taproot -- remember <content> --gist <gist> [--category <c>] [--salience
 | `--tags` | Comma-separated tags for retrieval within Taproot |
 | `--conversation-url` | URL of the source Claude.ai conversation (`https://claude.ai/chat/{id}`) for provenance |
 | `--search-keywords` | Comma-separated distinctive terms from the conversation to aid future retrieval |
-| `--update-id` | UUID of an existing memory to update instead of creating a new one |
+| `--update-id` | UUID of an existing memory to update instead of creating a new one. On update, only the flags you pass are sent: `<content>` and `--category` are optional and omitted fields keep their stored values. |
 | `--conversation-id` | Source conversation ID |
 
 #### `taproot forget`
