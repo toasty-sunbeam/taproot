@@ -23,7 +23,12 @@ import {
   escapeHtml,
   REFLECT_CONFIG,
   buildReflectPayload,
+  ARCHIVE_TAG,
+  isArchived,
+  CATEGORY_ORDER,
 } from "./storage.js";
+import type { MemoryMeta } from "./storage.js";
+import { auditContent } from "./audit.js";
 import { handleDashboardRequest } from "./dashboard.js";
 
 export type { Env } from "./storage.js";
@@ -46,7 +51,7 @@ interface JsonRpcResponse {
 
 // ─── MCP Metadata ─────────────────────────────────────────────────────────────
 
-const SERVER_INFO = { name: "taproot", version: "0.3.0" };
+const SERVER_INFO = { name: "taproot", version: "0.4.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 
 // ─── Tool Definitions (MCP schema) ───────────────────────────────────────────
@@ -62,18 +67,18 @@ const TOOLS = [
   {
     name: "taproot_remember",
     description:
-      "Write a new memory or update an existing one. New memories require a gist — write it now, at encoding time, rather than leaving it to be reconstructed later.",
+      "Write a new memory or update an existing one. Creating requires category, content and gist — write the gist now, at encoding time, rather than leaving it to be reconstructed later. Updating (update_id) is a partial merge: send only the fields you want to change; every omitted field keeps its stored value (e.g. a gist-only or salience-only update leaves content untouched). Empty content is rejected, never treated as a wipe.",
     inputSchema: {
       type: "object",
       properties: {
         category: {
           type: "string",
           enum: ["identity", "relationship", "active_thread", "episodic", "error"],
-          description: "Memory category",
+          description: "Memory category. Required when creating; optional on update (omit to keep the current category).",
         },
         content: {
           type: "string",
-          description: "Natural language memory text",
+          description: "Natural language memory text. Required when creating; optional on update (omit to keep the current content). Must not be empty.",
         },
         gist: {
           type: "string",
@@ -128,16 +133,16 @@ const TOOLS = [
         },
         update_id: {
           type: "string",
-          description: "If provided, updates this existing memory instead of creating a new one",
+          description: "If provided, updates this existing memory instead of creating a new one. Only the fields you send are changed.",
         },
       },
-      required: ["category", "content"],
+      required: [],
     },
   },
   {
     name: "taproot_recall",
     description:
-      "Retrieve full-text memories ranked by activation (recency, frequency, salience, and relevance to your query). Use this to pull full text for anything that looked relevant in the taproot_reflect catalog. Every memory returned is 'strengthened' by default — its retrieval count and last-touched date update, making it more likely to surface again. Pass strengthen:false for administrative or bulk reads that shouldn't count as attention (e.g. verification sweeps, diagnostics) — otherwise those reads inflate last_retrieved and hold memories artificially 'fresh' in the taproot_reflect catalog window.",
+      "Retrieve full-text memories ranked by activation (recency, frequency, salience, and relevance to your query). Use this to pull full text for anything that looked relevant in the taproot_reflect catalog. Every memory returned is 'strengthened' by default — its retrieval count and last-touched date update, making it more likely to surface again. Pass strengthen:false for administrative or bulk reads that shouldn't count as attention (e.g. verification sweeps, diagnostics) — otherwise those reads inflate last_retrieved and hold memories artificially 'fresh' in the taproot_reflect catalog window. For admin sweeps (\"show me every active thread\"), use taproot_list instead: recall ranks by activation, so a topical sweep can miss memories that were never recalled, and it returns full content.",
     inputSchema: {
       type: "object",
       properties: {
@@ -169,6 +174,40 @@ const TOOLS = [
       },
       required: [],
     },
+  },
+  {
+    name: "taproot_list",
+    description:
+      "Inventory: list every memory (optionally in one category) as a lightweight summary without content. Use this for admin sweeps and hygiene reviews (\"review all active threads\", \"what's archived?\") instead of topic-query taproot_recall, which ranks by activation and can miss memories that were never recalled, and which returns full text. Read-only: never strengthens (last_retrieved and retrieval_count don't change). Order is deterministic (updated_at newest first, then id), and `total` is the full count for your filter, so page with next_cursor until it's null and you have everything. Use taproot_recall with ids to load full text for anything that needs it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: {
+          type: "string",
+          enum: ["identity", "relationship", "active_thread", "episodic", "error"],
+          description: "Only list this category. Omit for all categories.",
+        },
+        include_archived: {
+          type: "boolean",
+          description: "Include archived (soft-deleted) memories. Default false. Each item has an `archived` flag either way.",
+        },
+        limit: {
+          type: "number",
+          description: "Page size (default 50, max 250).",
+        },
+        cursor: {
+          type: "string",
+          description: "next_cursor from the previous page. Omit for the first page.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "taproot_audit",
+    description:
+      "Admin, read-only: find memories whose content is missing, empty, or not a string (the pre-v0.4 partial-update bug could blank content). Reports id, category, gist, updated_at and archived status, plus the newest backup:schema-v2-* snapshot that still holds non-empty content for that id, if one exists. Never repairs anything.",
+    inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "taproot_forget",
@@ -232,7 +271,7 @@ const TOOLS = [
   {
     name: "taproot_status",
     description:
-      "Report on the current state of the memory system: counts by category, storage used, compression queue, Tier 1/Tier 2 sizes, and approximate taproot_reflect payload size.",
+      "Report on the current state of the memory system: live (non-archived) counts by category in memory_counts, archived counts by category in archived_counts, compression queue, Tier 1/Tier 2 sizes, and approximate taproot_reflect payload size.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -335,8 +374,8 @@ async function handleReflect(_params: unknown, env: Env): Promise<string> {
 
 async function handleRemember(params: unknown, env: Env): Promise<string> {
   const p = params as {
-    category: string;
-    content: string;
+    category?: string;
+    content?: string;
     gist?: string;
     salience?: string;
     core?: boolean;
@@ -350,50 +389,80 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     search_keywords?: string[];
     update_id?: string;
   };
+  const isUpdate = typeof p.update_id === "string" && p.update_id !== "";
+  const err = (message: string) => JSON.stringify({ status: "error", message }, null, 2);
 
-  const resolvedCategory = typeof p.category === "string" ? resolveCategory(p.category) : null;
-  if (!resolvedCategory) {
-    return JSON.stringify({
-      status: "error",
-      message: `Invalid category "${String(p.category)}". Use one of: identity, relationship, active_thread, episodic, error.`,
-    }, null, 2);
+  // Category: required on create, optional on update (omitted = keep).
+  let resolvedCategory: { category: MemoryCategory; coerced: boolean } | null = null;
+  if (p.category !== undefined || !isUpdate) {
+    resolvedCategory = typeof p.category === "string" ? resolveCategory(p.category) : null;
+    if (!resolvedCategory) {
+      return err(`Invalid category "${String(p.category)}". Use one of: identity, relationship, active_thread, episodic, error.`);
+    }
   }
 
   let resolvedSalience: { salience: MemorySalience; coerced: boolean } | null = null;
   if (p.salience !== undefined) {
     resolvedSalience = typeof p.salience === "string" ? resolveSalience(p.salience) : null;
     if (!resolvedSalience) {
-      return JSON.stringify({
-        status: "error",
-        message: `Invalid salience "${String(p.salience)}". Use one of: high, medium, low.`,
-      }, null, 2);
+      return err(`Invalid salience "${String(p.salience)}". Use one of: high, medium, low.`);
     }
   }
 
+  // Content: required on create. On update it may be omitted (keep), but an
+  // explicit empty/whitespace/non-string value is an error, never a wipe —
+  // before v0.4 an omitted content silently blanked the stored text.
+  if (p.content !== undefined || !isUpdate) {
+    if (typeof p.content !== "string" || !p.content.trim()) {
+      return err(isUpdate
+        ? "content must be a non-empty string. To keep the current content, omit the content field entirely."
+        : "content is required when creating a memory and must be a non-empty string.");
+    }
+  }
+  if (p.gist !== undefined && (typeof p.gist !== "string" || !p.gist.trim())) {
+    return err("gist must be a non-empty string. To keep the current gist, omit the gist field.");
+  }
+
   const warnings: string[] = [];
-  if (resolvedCategory.coerced) warnings.push(`category "${p.category}" is deprecated — coerced to "${resolvedCategory.category}"`);
+  if (resolvedCategory?.coerced) warnings.push(`category "${p.category}" is deprecated — coerced to "${resolvedCategory.category}"`);
   if (resolvedSalience?.coerced) warnings.push(`salience "${p.salience}" is deprecated — coerced to "${resolvedSalience.salience}"`);
 
   const now = new Date().toISOString();
   let memory: Memory;
 
-  if (p.update_id) {
-    const existing = await getMemory(env.TAPROOT_KV, p.update_id);
+  if (isUpdate) {
+    const existing = await getMemory(env.TAPROOT_KV, p.update_id!);
     if (!existing) {
-      return JSON.stringify({ status: "error", message: `Memory ${p.update_id} not found` }, null, 2);
+      return err(`Memory ${p.update_id} not found`);
+    }
+    // Merge: start from the stored record and overwrite only what the
+    // caller actually sent. Category lives in the record and its own KV
+    // metadata (no separate per-category index keys), so changing it is a
+    // single putMemory on the same mem:{id} key — nothing to move or orphan.
+    const contentChanged = p.content !== undefined && p.content !== existing.content;
+    const newContent = p.content !== undefined ? p.content : existing.content;
+    let gist = existing.gist;
+    let gistAuto = existing.gist_autogenerated;
+    if (p.gist !== undefined) {
+      gist = p.gist.trim();
+      gistAuto = false;
+    } else if (contentChanged && existing.gist_autogenerated) {
+      // Auto-generated gists track content, so recompute only when content
+      // actually changed. Hand-written gists are never overwritten.
+      gist = autoGist(newContent);
     }
     memory = {
       ...existing,
-      category: resolvedCategory.category,
-      content: p.content,
-      gist: p.gist !== undefined ? p.gist.trim() : existing.gist,
-      gist_autogenerated: p.gist !== undefined ? false : existing.gist_autogenerated,
+      category: resolvedCategory?.category ?? existing.category,
+      content: newContent,
+      gist,
+      gist_autogenerated: gistAuto,
       salience: resolvedSalience?.salience ?? existing.salience,
       core: p.core ?? existing.core,
       epistemic_status: p.epistemic_status ?? existing.epistemic_status,
       provenance: p.provenance !== undefined ? p.provenance : existing.provenance,
       tags: p.tags !== undefined ? toStringArray(p.tags) : existing.tags,
-      linked_memories: p.linked_memories ?? existing.linked_memories,
+      linked_memories: p.linked_memories !== undefined ? toStringArray(p.linked_memories) : existing.linked_memories,
       source: {
         ...existing.source,
         ...(p.conversation_id !== undefined ? { conversation_id: p.conversation_id } : {}),
@@ -405,16 +474,14 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
     };
   } else {
     if (!p.gist || typeof p.gist !== "string" || !p.gist.trim()) {
-      return JSON.stringify({
-        status: "error",
-        message:
-          "gist is required when creating a memory — a ~15-word one-line summary for the taproot_reflect catalog. Write it now, at encoding time; it's cheaper than reconstructing it from content later.",
-      }, null, 2);
+      return err(
+        "gist is required when creating a memory — a ~15-word one-line summary for the taproot_reflect catalog. Write it now, at encoding time; it's cheaper than reconstructing it from content later.",
+      );
     }
     memory = {
       id: crypto.randomUUID(),
-      category: resolvedCategory.category,
-      content: p.content,
+      category: resolvedCategory!.category,
+      content: p.content!,
       gist: p.gist.trim(),
       gist_autogenerated: false,
       salience: resolvedSalience?.salience ?? "medium",
@@ -432,7 +499,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
         ...(p.transcript_ref ? { transcript_ref: p.transcript_ref } : {}),
       },
       compression_level: 0,
-      linked_memories: p.linked_memories ?? [],
+      linked_memories: toStringArray(p.linked_memories),
       tags: toStringArray(p.tags),
       ...(p.conversation_url !== undefined ? { conversation_url: p.conversation_url } : {}),
       search_keywords: toStringArray(p.search_keywords),
@@ -443,7 +510,7 @@ async function handleRemember(params: unknown, env: Env): Promise<string> {
 
   return JSON.stringify({
     status: "ok",
-    action: p.update_id ? "updated" : "created",
+    action: isUpdate ? "updated" : "created",
     memory_id: memory.id,
     category: memory.category,
     core: memory.core,
@@ -497,7 +564,7 @@ async function handleRecall(params: unknown, env: Env): Promise<string> {
   const allKeys = await listMemoryKeys(env.TAPROOT_KV);
 
   // Filter using metadata to avoid fetching records we'll discard
-  let candidateKeys = allKeys.filter(k => !metaHasTag(k.metadata?.tags, "_archive_pending"));
+  let candidateKeys = allKeys.filter(k => !isArchived(k.metadata?.tags));
 
   const ids = toStringArray(p.ids);
   if (ids.length > 0) {
@@ -574,8 +641,8 @@ async function handleForget(params: unknown, env: Env): Promise<string> {
   }
 
   // archive: soft delete — tag the memory so it's excluded from normal recall
-  if (!memory.tags.includes("_archive_pending")) {
-    memory.tags.push("_archive_pending");
+  if (!memory.tags.includes(ARCHIVE_TAG)) {
+    memory.tags.push(ARCHIVE_TAG);
   }
   memory.updated_at = new Date().toISOString();
   await putMemory(env.TAPROOT_KV, memory);
@@ -833,23 +900,36 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     listClosingKeys(env.TAPROOT_KV),
   ]);
 
-  const counts: Record<MemoryCategory, number> = {
+  // v0.4: memory_counts is LIVE only. Before this it counted archived
+  // records too, so archiving never lowered it. Archived records get their
+  // own archived_counts so they stay visible without passing as live.
+  const zero = (): Record<MemoryCategory, number> => ({
     identity: 0,
     relationship: 0,
     active_thread: 0,
     episodic: 0,
     error: 0,
-  };
+  });
+  const counts = zero();
+  const archivedCounts = zero();
+  let liveTotal = 0;
+  let archivedTotal = 0;
   let compressionQueue = 0;
   let coreCount = 0;
 
   for (const k of allKeys) {
     const cat = k.metadata?.category;
-    if (cat && cat in counts) counts[cat]++;
-    if (metaHasTag(k.metadata?.tags, "_compress_pending") || metaHasTag(k.metadata?.tags, "_archive_pending")) {
+    const archived = isArchived(k.metadata?.tags);
+    if (archived) archivedTotal++;
+    else liveTotal++;
+    if (cat && cat in counts) (archived ? archivedCounts : counts)[cat]++;
+    // Unchanged from v0.3 on purpose: scheduled tasks read this field, and
+    // it has always meant "tagged for compression OR archived".
+    if (metaHasTag(k.metadata?.tags, "_compress_pending") || archived) {
       compressionQueue++;
     }
-    if (k.metadata?.core === true) coreCount++;
+    // Live only, matching reflect's core_count. Archived records never load.
+    if (k.metadata?.core === true && !archived) coreCount++;
   }
 
   const reflectPayload = await buildReflectPayload(env, { allKeys, closingKeys });
@@ -871,7 +951,10 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
     status: "operational",
     storage: "connected",
     memory_counts: counts,
-    total_memories: allKeys.length,
+    archived_counts: archivedCounts,
+    total_memories: liveTotal,
+    total_archived: archivedTotal,
+    total_stored: allKeys.length,
     compression_queue: compressionQueue,
     closings_count: closingKeys.length,
     tiers: {
@@ -884,6 +967,155 @@ async function handleStatus(_params: unknown, env: Env): Promise<string> {
       approx_reflect_payload_kb: approxReflectKb,
     },
   }, null, 2);
+}
+
+// ─── taproot_list (v0.4) ─────────────────────────────────────────────────────
+// Lightweight inventory. Filtering and ordering run on KV list metadata, so
+// only the requested page's records are fetched in full (retrieval_count isn't
+// carried in metadata). Never writes.
+
+export const LIST_CONFIG = { DEFAULT_LIMIT: 50, MAX_LIMIT: 250 } as const;
+
+interface ListEntry {
+  id: string;
+  category: string;
+  updated_at: string;
+  archived: boolean;
+  prefetched?: Memory;
+}
+
+// Sort key: updated_at descending, then id ascending. Total and stable, so
+// the keyset cursor below never skips or repeats an unchanged record.
+function compareListEntries(a: { updated_at: string; id: string }, b: { updated_at: string; id: string }): number {
+  return b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id);
+}
+
+function encodeListCursor(e: { updated_at: string; id: string }): string {
+  return btoa(JSON.stringify({ u: e.updated_at, i: e.id }));
+}
+
+function decodeListCursor(cursor: string): { updated_at: string; id: string } | null {
+  try {
+    const parsed = JSON.parse(atob(cursor)) as { u?: unknown; i?: unknown };
+    if (typeof parsed.u !== "string" || typeof parsed.i !== "string") return null;
+    return { updated_at: parsed.u, id: parsed.i };
+  } catch {
+    return null;
+  }
+}
+
+async function handleList(params: unknown, env: Env): Promise<string> {
+  const p = (params ?? {}) as { category?: unknown; include_archived?: unknown; limit?: unknown; cursor?: unknown };
+  const err = (message: string) => JSON.stringify({ status: "error", message }, null, 2);
+
+  if (p.category !== undefined && !CANONICAL_CATEGORIES.has(p.category as MemoryCategory)) {
+    return err(`Invalid category "${String(p.category)}". Use one of: identity, relationship, active_thread, episodic, error.`);
+  }
+  const category = p.category as MemoryCategory | undefined;
+  const includeArchived = p.include_archived === true;
+  let limit: number = LIST_CONFIG.DEFAULT_LIMIT;
+  if (p.limit !== undefined) {
+    const n = Number(p.limit);
+    if (!Number.isFinite(n) || n < 1) return err("limit must be a positive number.");
+    limit = Math.min(Math.floor(n), LIST_CONFIG.MAX_LIMIT);
+  }
+  let after: { updated_at: string; id: string } | null = null;
+  if (p.cursor !== undefined && p.cursor !== null && p.cursor !== "") {
+    after = typeof p.cursor === "string" ? decodeListCursor(p.cursor) : null;
+    if (!after) return err("Invalid cursor. Pass next_cursor from a previous taproot_list response unchanged, or omit it.");
+  }
+
+  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+  const entries: ListEntry[] = [];
+  const metadataless: Array<{ name: string; metadata?: MemoryMeta }> = [];
+  for (const k of allKeys) {
+    if (!k.metadata) {
+      metadataless.push(k);
+      continue;
+    }
+    entries.push({
+      id: idFromKey(k.name),
+      category: k.metadata.category,
+      updated_at: k.metadata.updated_at ?? k.metadata.created_at ?? "",
+      archived: isArchived(k.metadata.tags),
+    });
+  }
+  // Records written outside putMemory have no list metadata. Fetch them in
+  // full so they can't silently drop out of the inventory.
+  const fallback = (
+    await Promise.all(metadataless.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
+  ).filter((m): m is Memory => m !== null);
+  for (const m of fallback) {
+    entries.push({ id: m.id, category: m.category, updated_at: m.updated_at ?? m.created_at ?? "", archived: isArchived(m.tags), prefetched: m });
+  }
+
+  const filtered = entries
+    .filter(e => (category ? e.category === category : true))
+    .filter(e => includeArchived || !e.archived)
+    .sort(compareListEntries);
+
+  const start = after ? filtered.findIndex(e => compareListEntries(e, after!) > 0) : 0;
+  const pageEntries = start === -1 ? [] : filtered.slice(start, start + limit);
+  const hasMore = start !== -1 && start + limit < filtered.length;
+
+  const records = await Promise.all(
+    pageEntries.map(e => e.prefetched ?? getMemory(env.TAPROOT_KV, e.id)),
+  );
+  const items = records
+    .filter((m): m is Memory => m !== null)
+    .map(m => ({
+      id: m.id,
+      category: m.category,
+      gist: m.gist,
+      salience: m.salience,
+      core: m.core,
+      created_at: m.created_at,
+      updated_at: m.updated_at,
+      last_retrieved: m.last_retrieved,
+      retrieval_count: m.retrieval_count,
+      archived: isArchived(m.tags),
+      tags: m.tags,
+    }));
+
+  const last = pageEntries[pageEntries.length - 1];
+  const byCategory: Record<string, number> = {};
+  for (const cat of CATEGORY_ORDER) byCategory[cat] = 0;
+  for (const e of filtered) byCategory[e.category] = (byCategory[e.category] ?? 0) + 1;
+
+  // Compact JSON (no indentation): keeps a full page well inside client
+  // tool-output limits. Lightweight output is the whole point of this tool.
+  return JSON.stringify({
+    status: "ok",
+    filter: { category: category ?? "all", include_archived: includeArchived },
+    total: filtered.length,
+    total_by_category: category ? { [category]: filtered.length } : byCategory,
+    count: items.length,
+    has_more: hasMore,
+    next_cursor: hasMore && last ? encodeListCursor(last) : null,
+    order: "updated_at desc, id asc",
+    items,
+  });
+}
+
+// ─── taproot_audit (v0.4) ────────────────────────────────────────────────────
+
+async function handleAudit(_params: unknown, env: Env): Promise<string> {
+  const allKeys = await listMemoryKeys(env.TAPROOT_KV);
+  // Raw reads, not getMemory: normalizeMemory would paper over shape problems.
+  const raw = (
+    await Promise.all(allKeys.map(async k => {
+      const v = await env.TAPROOT_KV.get(k.name);
+      if (!v) return null;
+      try {
+        return JSON.parse(v) as Record<string, unknown>;
+      } catch {
+        return { id: idFromKey(k.name), content: undefined, category: k.metadata?.category } as Record<string, unknown>;
+      }
+    }))
+  ).filter((r): r is Record<string, unknown> => r !== null);
+  const snapshots = await listBackupSnapshots(env.TAPROOT_KV);
+  const report = auditContent(raw, snapshots.map(s => ({ key: s.key, records: s.records })));
+  return JSON.stringify(report, null, 2);
 }
 
 async function handleClose(params: unknown, env: Env): Promise<string> {
@@ -933,6 +1165,17 @@ function jsonErr(id: string | number | null, code: number, message: string): Res
   });
 }
 
+// Exported for the test suite (test/*.test.ts). Not part of the Worker API.
+export const __test = {
+  handleRemember,
+  handleRecall,
+  handleForget,
+  handleStatus,
+  handleList,
+  handleAudit,
+  handleReflect,
+};
+
 async function handleMcp(request: Request, env: Env): Promise<Response> {
   // No auth check here — the OAuth provider validates the access token
   // before this handler is ever invoked.
@@ -979,6 +1222,8 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
           case "taproot_migrate":   result = await handleMigrate(args, env); break;
           case "taproot_restore_timestamps": result = await handleRestoreTimestamps(args, env); break;
           case "taproot_status":    result = await handleStatus(args, env); break;
+          case "taproot_list":      result = await handleList(args, env); break;
+          case "taproot_audit":     result = await handleAudit(args, env); break;
           case "taproot_close":     result = await handleClose(args, env); break;
           default:
             return jsonErr(id, -32601, `Unknown tool: ${p.name}`);
