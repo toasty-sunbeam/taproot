@@ -178,28 +178,38 @@ function toDashboardMemory(m: Memory, cutoffMs: number): DashboardMemory {
   };
 }
 
-async function handleListMemories(env: Env): Promise<Response> {
+// Data functions shared by the browser routes below and the MCP App tools in
+// index.ts (taproot_dash_*). They return plain objects; each caller wraps them
+// in its own transport (an HTTP JSON response, or an MCP tool result).
+
+export class DashboardError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+export async function listMemoriesData(env: Env) {
   const cutoffMs = Date.now() - REFLECT_CONFIG.CATALOG_WINDOW_DAYS * 86_400_000;
   const allKeys = await listMemoryKeys(env.TAPROOT_KV);
   const memories = (
     await Promise.all(allKeys.map(k => getMemory(env.TAPROOT_KV, idFromKey(k.name))))
   ).filter((m): m is Memory => m !== null);
 
-  return json({
+  return {
     memories: memories
       .map(m => toDashboardMemory(m, cutoffMs))
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
     catalog_window_days: REFLECT_CONFIG.CATALOG_WINDOW_DAYS,
-  });
+  };
 }
 
-async function handleListClosings(env: Env): Promise<Response> {
+export async function listClosingsData(env: Env) {
   const keys = await listClosingKeys(env.TAPROOT_KV);
   const closings = (
     await Promise.all(keys.map(k => getClosing(env.TAPROOT_KV, k.name.slice("close:".length))))
   ).filter((c): c is Closing => c !== null);
 
-  return json({
+  return {
     closings: closings
       .map(c => ({
         id: c.id,
@@ -209,29 +219,26 @@ async function handleListClosings(env: Env): Promise<Response> {
         created_at: c.created_at,
       }))
       .sort((a, b) => b.created_at.localeCompare(a.created_at)),
-  });
+  };
 }
 
-async function handleUpdateMemory(id: string, request: Request, env: Env): Promise<Response> {
-  let body: { salience?: unknown; core?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON body" }, 400);
-  }
-
+export async function updateMemoryData(
+  id: string,
+  body: { salience?: unknown; core?: unknown },
+  env: Env,
+) {
   if (body.salience !== undefined && !["high", "medium", "low"].includes(body.salience as string)) {
-    return json({ error: `Invalid salience "${String(body.salience)}"` }, 400);
+    throw new DashboardError(`Invalid salience "${String(body.salience)}"`, 400);
   }
   if (body.core !== undefined && typeof body.core !== "boolean") {
-    return json({ error: "core must be a boolean" }, 400);
+    throw new DashboardError("core must be a boolean", 400);
   }
   if (body.salience === undefined && body.core === undefined) {
-    return json({ error: "Provide salience and/or core to change" }, 400);
+    throw new DashboardError("Provide salience and/or core to change", 400);
   }
 
   const existing = await getMemory(env.TAPROOT_KV, id);
-  if (!existing) return json({ error: `Memory ${id} not found` }, 404);
+  if (!existing) throw new DashboardError(`Memory ${id} not found`, 404);
 
   // Deliberately does NOT bump updated_at, unlike taproot_promote. This
   // endpoint exists to trim the reflect payload — if editing salience
@@ -246,30 +253,135 @@ async function handleUpdateMemory(id: string, request: Request, env: Env): Promi
   await putMemory(env.TAPROOT_KV, updated);
 
   const cutoffMs = Date.now() - REFLECT_CONFIG.CATALOG_WINDOW_DAYS * 86_400_000;
-  return json({ memory: toDashboardMemory(updated, cutoffMs) });
+  return { memory: toDashboardMemory(updated, cutoffMs) };
 }
 
-async function handleReflectPreview(env: Env): Promise<Response> {
+export async function reflectPreviewData(env: Env) {
   const payload = await buildReflectPayload(env);
   const bytes = JSON.stringify(payload).length;
-  return json({
+  return {
     payload,
     approx_bytes: bytes,
     approx_kb: Math.round((bytes / 1024) * 10) / 10,
     approx_tokens: Math.ceil(bytes / 4),
     catalog_window_days: REFLECT_CONFIG.CATALOG_WINDOW_DAYS,
-  });
+  };
+}
+
+async function handleUpdateMemory(id: string, request: Request, env: Env): Promise<Response> {
+  let body: { salience?: unknown; core?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  try {
+    return json(await updateMemoryData(id, body, env));
+  } catch (e) {
+    if (e instanceof DashboardError) return json({ error: e.message }, e.status);
+    throw e;
+  }
 }
 
 // ─── Dashboard shell (client app) ─────────────────────────────────────────────
 
 function renderDashboardShell(): Response {
-  return new Response(DASHBOARD_HTML, {
+  return new Response(renderDashboardHtml("web"), {
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 }
 
-const DASHBOARD_HTML = `<!DOCTYPE html>
+// The same client runs in two places:
+//  - "web": the browser page at /dashboard, talking to /dashboard/api/* over a
+//    cookie session.
+//  - "app": an MCP App rendered inside Claude (ui://taproot/dashboard). There
+//    is no cookie and no same-origin API there; the sandboxed frame can only
+//    reach the Worker by asking Claude to call one of the app-only
+//    taproot_dash_* tools, which ride the connector's existing OAuth token.
+// Only the transport (api()), the header buttons and the boot sequence differ.
+
+const WEB_HEADER_BUTTONS = `<form class="logout" method="POST" action="/dashboard/logout"><button type="submit">Log out</button></form>`;
+const APP_HEADER_BUTTONS = `<button id="fullscreen">Fullscreen</button>`;
+
+// Inline in a chat the frame grows to fit its content, so cap the list's
+// height there (in px: vh inside an auto-sized frame feeds back on itself).
+const APP_STYLE = `
+  body.inline main { max-height: 560px; overflow-y: auto; }
+  body.inline header { position: static; }
+`;
+
+const WEB_SCRIPT_OPEN = `<script>`;
+const APP_SCRIPT_OPEN = `<script type="module">
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@1.7.5/dist/src/app-with-deps.js";
+const app = new App({ name: "Taproot Dashboard", version: "1.0.0" });
+`;
+
+const WEB_API = `async function api(path, opts) {
+  const res = await fetch(path, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...opts });
+  if (res.status === 401) { location.href = "/dashboard"; throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  return res.json();
+}`;
+
+const APP_API = `// Same contract as the web api(): a dashboard path in, parsed JSON out.
+async function api(path, opts = {}) {
+  const method = opts.method || "GET";
+  const MEM = "/dashboard/api/memories";
+  let name, args = {};
+  if (method === "GET" && path === MEM) name = "taproot_dash_memories";
+  else if (method === "GET" && path === "/dashboard/api/closings") name = "taproot_dash_closings";
+  else if (method === "GET" && path === "/dashboard/api/reflect") name = "taproot_dash_reflect";
+  else if (method === "PATCH" && path.startsWith(MEM + "/")) {
+    name = "taproot_dash_update";
+    args = { id: path.slice(MEM.length + 1), ...JSON.parse(opts.body || "{}") };
+  } else throw new Error("No tool for " + method + " " + path);
+
+  const result = await app.callServerTool({ name, arguments: args });
+  const text = result.content && result.content[0] && result.content[0].text;
+  if (result.isError) throw new Error(text || "Tool error");
+  // structuredContent is preferred; the JSON text is the fallback for hosts
+  // that negotiate an MCP version older than structured results.
+  const data = result.structuredContent ?? JSON.parse(text);
+  if (name === "taproot_dash_update") shareEdit(data.memory, args);
+  return data;
+}
+
+// Tell Claude what James changed here, so the conversation can see it without
+// him retyping it. updateModelContext replaces the app's previous context, so
+// send the whole session's log each time.
+const edits = [];
+function shareEdit(m, changes) {
+  const what = [];
+  if (changes.salience !== undefined) what.push("salience set to " + changes.salience);
+  if (changes.core !== undefined) what.push(changes.core ? "added to core" : "removed from core");
+  edits.push("- " + m.id + " [" + m.category + "] " + JSON.stringify(m.gist) + ": " + what.join(", "));
+  app.updateModelContext({
+    content: [{ type: "text", text: "James made these changes in the Taproot dashboard during this conversation:\\n" + edits.join("\\n") }],
+  }).catch(() => {});
+}`;
+
+const WEB_BOOT = `loadMemories().catch(e => toast("Failed to load: " + e.message));`;
+
+const APP_BOOT = `function applyDisplayMode(mode) {
+  const full = mode === "fullscreen";
+  document.body.classList.toggle("inline", !full);
+  document.getElementById("fullscreen").textContent = full ? "Exit fullscreen" : "Fullscreen";
+}
+app.ontoolresult = () => {};  // the opening tool's result is only a summary; the app loads its own data
+app.onhostcontextchanged = (ctx) => { if (ctx.displayMode) applyDisplayMode(ctx.displayMode); };
+document.getElementById("fullscreen").addEventListener("click", async () => {
+  const want = document.body.classList.contains("inline") ? "fullscreen" : "inline";
+  try { applyDisplayMode((await app.requestDisplayMode({ mode: want })).mode); }
+  catch { toast("This app can't change display mode here"); }
+});
+await app.connect();
+applyDisplayMode(app.getHostContext()?.displayMode ?? "inline");
+loadMemories().catch(e => toast("Failed to load: " + e.message));`;
+
+export function renderDashboardHtml(mode: "web" | "app"): string {
+  const isApp = mode === "app";
+
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -375,7 +487,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     body.sidebar-open #sidebar { width: 100%; position: fixed; inset: 0; z-index: 20; overflow-y: auto; }
     body.sidebar-open #sidebar-inner { width: 100%; }
   }
-</style>
+${isApp ? APP_STYLE : ""}</style>
 </head>
 <body>
   <header>
@@ -385,7 +497,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <button id="view-closings">Closings</button>
     <div class="spacer"></div>
     <button class="primary" id="toggle-sidebar">Reflect Preview</button>
-    <form class="logout" method="POST" action="/dashboard/logout"><button type="submit">Log out</button></form>
+    ${isApp ? APP_HEADER_BUTTONS : WEB_HEADER_BUTTONS}
   </header>
 
   <div class="legend" id="legend"></div>
@@ -424,7 +536,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="toast" id="toast"></div>
 
-<script>
+${isApp ? APP_SCRIPT_OPEN : WEB_SCRIPT_OPEN}
 const CATEGORIES = ["identity", "relationship", "active_thread", "error", "episodic"];
 const CATEGORY_LABELS = { identity: "Identity", relationship: "Relationship", active_thread: "Active Thread", error: "Error", episodic: "Episodic" };
 const CATEGORY_COLORS = {
@@ -460,12 +572,7 @@ function toast(msg) {
   setTimeout(() => t.classList.remove("show"), 1800);
 }
 
-async function api(path, opts) {
-  const res = await fetch(path, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...opts });
-  if (res.status === 401) { location.href = "/dashboard"; throw new Error("unauthorized"); }
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
-  return res.json();
-}
+${isApp ? APP_API : WEB_API}
 
 function buildLegend() {
   const legend = document.getElementById("legend");
@@ -718,10 +825,11 @@ document.getElementById("sort").addEventListener("change", (e) => { sort = e.tar
 
 buildLegend();
 buildCatFilterChips();
-loadMemories().catch(e => toast("Failed to load: " + e.message));
+${isApp ? APP_BOOT : WEB_BOOT}
 </script>
 </body>
 </html>`;
+}
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
@@ -739,17 +847,17 @@ export async function handleDashboardRequest(request: Request, env: Env): Promis
     return handleLogout(request, env);
   }
   if (url.pathname === "/dashboard/api/memories" && request.method === "GET") {
-    return requireAuth(request, env, () => handleListMemories(env));
+    return requireAuth(request, env, async () => json(await listMemoriesData(env)));
   }
   if (url.pathname === "/dashboard/api/closings" && request.method === "GET") {
-    return requireAuth(request, env, () => handleListClosings(env));
+    return requireAuth(request, env, async () => json(await listClosingsData(env)));
   }
   if (url.pathname.startsWith("/dashboard/api/memories/") && request.method === "PATCH") {
     const id = url.pathname.slice("/dashboard/api/memories/".length);
     return requireAuth(request, env, () => handleUpdateMemory(id, request, env));
   }
   if (url.pathname === "/dashboard/api/reflect" && request.method === "GET") {
-    return requireAuth(request, env, () => handleReflectPreview(env));
+    return requireAuth(request, env, async () => json(await reflectPreviewData(env)));
   }
 
   return json({ error: "Not found" }, 404);
