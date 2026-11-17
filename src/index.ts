@@ -61,7 +61,19 @@ interface JsonRpcResponse {
 // ─── MCP Metadata ─────────────────────────────────────────────────────────────
 
 const SERVER_INFO = { name: "taproot", version: "0.4.0" };
-const PROTOCOL_VERSION = "2024-11-05";
+// MCP protocol versions this server speaks, newest first. 2025-06-18 is the
+// one that added structured tool results and _meta, which MCP Apps (the
+// dashboard and the per-tool result views) build on; while Taproot answered
+// 2024-11-05, hosts had no reason to treat it as an app-capable server.
+// Negotiation per the spec: echo the client's requested version if we support
+// it, otherwise offer our latest and let the client decide.
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"] as const;
+
+function negotiateProtocolVersion(requested: unknown): string {
+  return (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(requested as string)
+    ? (requested as string)
+    : SUPPORTED_PROTOCOL_VERSIONS[0];
+}
 
 // ─── Tool Definitions (MCP schema) ───────────────────────────────────────────
 
@@ -1324,7 +1336,7 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
   switch (body.method) {
     case "initialize":
       return jsonOk(id, {
-        protocolVersion: PROTOCOL_VERSION,
+        protocolVersion: negotiateProtocolVersion((body.params as { protocolVersion?: unknown } | undefined)?.protocolVersion),
         capabilities: { tools: {}, resources: {} },
         serverInfo: SERVER_INFO,
       });
