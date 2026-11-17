@@ -1333,6 +1333,19 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
 
   const id = body.id ?? null;
 
+  // One line per MCP request, visible in `wrangler tail`. Shows which methods
+  // a client actually calls: e.g. whether Claude ever fetches an MCP App's UI
+  // with resources/read. Logs method names, tool names, resource URIs and the
+  // negotiated protocol version, never arguments or memory content.
+  const p0 = body.params as { name?: string; uri?: string; protocolVersion?: string; clientInfo?: { name?: string; version?: string }; capabilities?: { extensions?: Record<string, unknown> } } | undefined;
+  const detail =
+    body.method === "tools/call" ? p0?.name :
+    body.method === "resources/read" ? p0?.uri :
+    body.method === "initialize"
+      ? `client=${p0?.clientInfo?.name ?? "?"}/${p0?.clientInfo?.version ?? "?"} protocol=${p0?.protocolVersion ?? "?"} ui_ext=${Object.keys(p0?.capabilities?.extensions ?? {}).join(",") || "none"}`
+      : "";
+  console.log(`[taproot] mcp ${body.method}${detail ? " " + detail : ""}`);
+
   switch (body.method) {
     case "initialize":
       return jsonOk(id, {
@@ -1342,7 +1355,11 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
       });
 
     case "notifications/initialized":
-      return new Response(null, { status: 204 });
+      // Streamable HTTP: a POST carrying only a notification gets 202 Accepted.
+      return new Response(null, { status: 202 });
+
+    case "resources/templates/list":
+      return jsonOk(id, { resourceTemplates: [] });
 
     case "ping":
       return jsonOk(id, {});

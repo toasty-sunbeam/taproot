@@ -184,3 +184,16 @@ test("initialize offers the latest supported version for unknown or missing requ
   assert.equal((await rpc(env, "initialize", { protocolVersion: "2099-01-01" })).result.protocolVersion, "2025-06-18");
   assert.equal((await rpc(env, "initialize")).result.protocolVersion, "2025-06-18");
 });
+
+// ─── Transport details ───────────────────────────────────────────────────────
+
+test("notifications get 202 Accepted; resources/templates/list is an empty list", async () => {
+  const { env } = makeEnv();
+  const req = new Request("https://taproot.test/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  });
+  assert.equal((await __test.handleMcp(req, env)).status, 202);
+  assert.deepEqual((await rpc(env, "resources/templates/list")).result, { resourceTemplates: [] });
+});
