@@ -168,3 +168,19 @@ test("the result view script parses as JavaScript", async () => {
   const script = html.slice(html.indexOf(">", open) + 1, html.lastIndexOf("</script>")).replace(/^import .*$/m, "");
   assert.doesNotThrow(() => new Function(`return (async () => {${script}\n})`));
 });
+
+// ─── Protocol version negotiation ────────────────────────────────────────────
+
+test("initialize echoes a supported requested protocol version", async () => {
+  const { env } = makeEnv();
+  for (const v of ["2025-06-18", "2025-03-26", "2024-11-05"]) {
+    const r = await rpc(env, "initialize", { protocolVersion: v, capabilities: {}, clientInfo: { name: "t", version: "1" } });
+    assert.equal(r.result.protocolVersion, v);
+  }
+});
+
+test("initialize offers the latest supported version for unknown or missing requests", async () => {
+  const { env } = makeEnv();
+  assert.equal((await rpc(env, "initialize", { protocolVersion: "2099-01-01" })).result.protocolVersion, "2025-06-18");
+  assert.equal((await rpc(env, "initialize")).result.protocolVersion, "2025-06-18");
+});
