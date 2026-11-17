@@ -29,7 +29,16 @@ import {
 } from "./storage.js";
 import type { MemoryMeta } from "./storage.js";
 import { auditContent } from "./audit.js";
-import { handleDashboardRequest } from "./dashboard.js";
+import {
+  handleDashboardRequest,
+  renderDashboardHtml,
+  listMemoriesData,
+  listClosingsData,
+  updateMemoryData,
+  reflectPreviewData,
+  DashboardError,
+} from "./dashboard.js";
+import { RESULT_VIEW_PREFIX, renderResultViewHtml, resultViewUri } from "./result-view.js";
 
 export type { Env } from "./storage.js";
 
@@ -55,6 +64,129 @@ const SERVER_INFO = { name: "taproot", version: "0.4.0" };
 const PROTOCOL_VERSION = "2024-11-05";
 
 // ─── Tool Definitions (MCP schema) ───────────────────────────────────────────
+
+// ─── MCP App: the dashboard inside Claude ─────────────────────────────────────
+// taproot_dashboard is the one model-visible entry point; its _meta.ui points
+// at a ui:// resource holding the dashboard client, which Claude renders in a
+// sandboxed frame. The frame fetches its data through the app-only
+// taproot_dash_* tools (visibility ["app"]): hosts hide those from the model
+// but let the app call them, over the same OAuth connection as everything else.
+// See https://modelcontextprotocol.io/extensions/apps/overview
+
+const DASHBOARD_UI_URI = "ui://taproot/dashboard";
+const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
+const APP_ONLY = { ui: { visibility: ["app"] } };
+
+const DASHBOARD_TOOLS = [
+  {
+    name: "taproot_dashboard",
+    title: "Taproot dashboard",
+    description:
+      "Open James's Taproot memory dashboard inside the conversation: browse and search every memory, filter by category, tier and salience, read closings, preview the reflect payload, and change a memory's salience or core flag. Use when James asks to see, browse or curate what's in Taproot. Returns a short status summary; the dashboard loads its own data.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    // ui.resourceUri is the current key; "ui/resourceUri" is the legacy flat
+    // key the SDK's registerAppTool also writes, for older hosts.
+    _meta: { ui: { resourceUri: DASHBOARD_UI_URI }, "ui/resourceUri": DASHBOARD_UI_URI },
+  },
+  {
+    name: "taproot_dash_memories",
+    description: "Dashboard app only: every memory in dashboard wire format.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    _meta: APP_ONLY,
+  },
+  {
+    name: "taproot_dash_closings",
+    description: "Dashboard app only: every closing reflection, newest first.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    _meta: APP_ONLY,
+  },
+  {
+    name: "taproot_dash_reflect",
+    description: "Dashboard app only: the current reflect payload and its approximate size.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    _meta: APP_ONLY,
+  },
+  {
+    name: "taproot_dash_update",
+    description:
+      "Dashboard app only: set a memory's salience and/or core flag. Does not bump updated_at (see dashboard.ts).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        salience: { type: "string", enum: ["high", "medium", "low"] },
+        core: { type: "boolean" },
+      },
+      required: ["id"],
+    },
+    _meta: APP_ONLY,
+  },
+];
+
+// Every regular tool also gets a result view (src/result-view.ts) so its JSON
+// renders as readable cards in the chat. Existing _meta keys are kept.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function withResultView(tool: any) {
+  const uri = resultViewUri(tool.name);
+  return { ...tool, _meta: { ...(tool._meta ?? {}), ui: { resourceUri: uri }, "ui/resourceUri": uri } };
+}
+
+function resultViewResources() {
+  return TOOLS.map(t => ({
+    uri: resultViewUri(t.name),
+    name: `${t.name} view`,
+    description: `Readable view of a ${t.name} result`,
+    mimeType: MCP_APP_MIME_TYPE,
+  }));
+}
+
+const DASHBOARD_RESOURCE = {
+  uri: DASHBOARD_UI_URI,
+  name: "Taproot dashboard",
+  description: "Interactive memory dashboard rendered by taproot_dashboard",
+  mimeType: MCP_APP_MIME_TYPE,
+};
+
+// Returns null when `name` isn't a dashboard tool, so the caller falls through
+// to the regular text tools. Results carry structuredContent for the app and
+// the same JSON as text, for hosts that negotiate a pre-structuredContent
+// protocol version.
+async function handleDashboardTool(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+): Promise<{ content: Array<{ type: "text"; text: string }>; structuredContent?: unknown; isError?: boolean } | null> {
+  const ok = (data: object) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }], structuredContent: data });
+  try {
+    switch (name) {
+      case "taproot_dashboard": {
+        const status = JSON.parse(await handleStatus({}, env));
+        const counts = Object.entries(status.memory_counts ?? {})
+          .map(([k, v]) => `${k} ${v}`)
+          .join(", ");
+        return {
+          content: [{
+            type: "text",
+            text: `Opened the Taproot dashboard. ${status.total_memories} live memories (${counts}); ${status.total_archived} archived.`,
+          }],
+          structuredContent: status,
+        };
+      }
+      case "taproot_dash_memories": return ok(await listMemoriesData(env));
+      case "taproot_dash_closings": return ok(await listClosingsData(env));
+      case "taproot_dash_reflect":  return ok(await reflectPreviewData(env));
+      case "taproot_dash_update": {
+        if (typeof args.id !== "string" || !args.id) throw new DashboardError("id is required", 400);
+        return ok(await updateMemoryData(args.id, args, env));
+      }
+      default:
+        return null;
+    }
+  } catch (e) {
+    if (e instanceof DashboardError) return { content: [{ type: "text", text: e.message }], isError: true };
+    throw e;
+  }
+}
 
 const TOOLS = [
   {
@@ -1167,6 +1299,7 @@ function jsonErr(id: string | number | null, code: number, message: string): Res
 
 // Exported for the test suite (test/*.test.ts). Not part of the Worker API.
 export const __test = {
+  handleMcp,
   handleRemember,
   handleRecall,
   handleForget,
@@ -1192,7 +1325,7 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
     case "initialize":
       return jsonOk(id, {
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, resources: {} },
         serverInfo: SERVER_INFO,
       });
 
@@ -1203,13 +1336,51 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
       return jsonOk(id, {});
 
     case "tools/list":
-      return jsonOk(id, { tools: TOOLS });
+      return jsonOk(id, { tools: [...TOOLS.map(withResultView), ...DASHBOARD_TOOLS] });
+
+    case "resources/list":
+      return jsonOk(id, { resources: [DASHBOARD_RESOURCE, ...resultViewResources()] });
+
+    case "resources/read": {
+      const uri = (body.params as { uri?: string } | undefined)?.uri;
+      // Shared by both kinds of app: the frame only runs inline scripts by
+      // default, so allow the MCP Apps client bundle from unpkg. No ui.domain:
+      // neither app makes direct network calls, so neither needs a stable
+      // sandbox origin.
+      const appMeta = { ui: { csp: { resourceDomains: ["https://unpkg.com"] } } };
+
+      if (uri?.startsWith(RESULT_VIEW_PREFIX)) {
+        const tool = uri.slice(RESULT_VIEW_PREFIX.length);
+        if (!TOOLS.some(t => t.name === tool)) return jsonErr(id, -32002, `Resource not found: ${uri}`);
+        return jsonOk(id, {
+          contents: [{ uri, mimeType: MCP_APP_MIME_TYPE, text: renderResultViewHtml(tool), _meta: appMeta }],
+        });
+      }
+      if (uri !== DASHBOARD_UI_URI) return jsonErr(id, -32002, `Resource not found: ${uri}`);
+      return jsonOk(id, {
+        contents: [{
+          uri: DASHBOARD_UI_URI,
+          mimeType: MCP_APP_MIME_TYPE,
+          text: renderDashboardHtml("app"),
+          _meta: appMeta,
+        }],
+      });
+    }
 
     case "tools/call": {
       const p = body.params as { name: string; arguments?: unknown } | undefined;
       if (!p?.name) return jsonErr(id, -32602, "Missing tool name");
 
       const args = p.arguments ?? {};
+
+      try {
+        const dash = await handleDashboardTool(p.name, args as Record<string, unknown>, env);
+        if (dash) return jsonOk(id, dash);
+      } catch (e) {
+        console.error(`[taproot] ${p.name} threw:`, e instanceof Error ? (e.stack ?? e.message) : e);
+        return jsonErr(id, -32603, e instanceof Error ? e.message : "Internal error");
+      }
+
       let result: string;
 
       try {
